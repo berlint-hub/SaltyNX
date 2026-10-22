@@ -495,6 +495,37 @@ typedef s64 rl_value_t;
  * in the old libnx32_min header. */
 #define RL_SESSIONS ((LimitableResource)4)
 
+/* How many sessions this process may hold at the same time. The process SaltyNX
+ * hijacks can come with a tiny limit - NetherSX2 only got a single session, which
+ * SaltyNX Core occupies while it bootstraps, so the app itself could never connect
+ * to any IPC port (it reported 0x10801 = KernelError_OutOfResource on every try).
+ * svcSetResourceLimitLimitValue only refuses values below the current usage, so
+ * the limit is raised before Core starts using the SaltySD port. */
+#define SALTYNX_SESSION_LIMIT 32
+
+static rl_value_t g_sessionLimitBefore = -1;
+static rl_value_t g_sessionLimitAfter  = -1;
+
+static void SaltySDCore_RaiseSessionLimit(void)
+{
+	u64 resourceLimitHandle = 0;
+	if (R_FAILED(svcGetInfo(&resourceLimitHandle, InfoType_ResourceLimit, INVALID_HANDLE, 0)) ||
+	    !resourceLimitHandle)
+		return;
+
+	Handle limit = (Handle)resourceLimitHandle;
+	rl_value_t current = -1;
+	if (R_SUCCEEDED(svcGetResourceLimitLimitValue(&current, limit, RL_SESSIONS)))
+	{
+		g_sessionLimitBefore = current;
+		g_sessionLimitAfter  = current;
+		if (current < SALTYNX_SESSION_LIMIT &&
+		    R_SUCCEEDED(svcSetResourceLimitLimitValue(limit, RL_SESSIONS, SALTYNX_SESSION_LIMIT)))
+			g_sessionLimitAfter = SALTYNX_SESSION_LIMIT;
+	}
+	svcCloseHandle(limit);
+}
+
 static void SaltySDCore_ProbePorts(const char* stage)
 {
 	Handle neth = INVALID_HANDLE;
@@ -508,7 +539,7 @@ static void SaltySDCore_ProbePorts(const char* stage)
 	if (R_SUCCEEDED(legacyRc)) svcCloseHandle(legacy);
 
 	u64 limitValue = 0;
-	Result limitRc = svcGetInfo(&limitValue, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0);
+	Result limitRc = svcGetInfo(&limitValue, InfoType_ResourceLimit, INVALID_HANDLE, 0);
 	Handle limit = (Handle)limitValue;
 	rl_value_t cur = -1, max = -1;
 	if (R_SUCCEEDED(limitRc))
@@ -535,9 +566,15 @@ int main(int argc, char *argv[])
 
 	SaltySDCore_RegisterExistingModules();
 	strtod_ptr = SaltySDCore_FindSymbolBuiltin("strtod");
+
+	/* Make room for both Core and the app before anyone opens a session. */
+	SaltySDCore_RaiseSessionLimit();
+
 	ret = SaltySD_Init();
 	if (ret) goto fail;
 
+	SaltySDCore_printf(MODULE_NAME " " APP_VERSION ": session limit %d -> %d\n",
+	                   (int)g_sessionLimitBefore, (int)g_sessionLimitAfter);
 	SaltySDCore_ProbePorts("after-init");
 
 	SaltySDCore_printf(MODULE_NAME " " APP_VERSION ": restoring code...\n");

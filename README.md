@@ -88,6 +88,20 @@ Result codes a client can see when it connects to `NethFPS`:
 | `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
 | `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
+### The hijacked process may only allow one session
+
+Some titles SaltyNX hijacks are created with a session limit of **one** (`LimitableResource_SessionCountMax`). SaltyNX Core occupies that single slot while it bootstraps, so the app living in the same process cannot open *any* IPC session of its own and gets `0x10801` (`KernelError_OutOfResource`) on every connect - even though the endpoint it targets has free sessions. This is what NetherSX2 hit.
+
+Since 2.1.8 Core raises the limit of the process it lives in before it connects to `SaltySD`:
+
+```
+SaltyNX Core 2.1.8: session limit 1 -> 32
+SaltyNX Core: probe[after-init] pid=142 nethfps=0x0 saltySD=0x10801 sessions=1/32 limitrc=0x0
+SaltyNX Core: probe[after-deinit] nethfps=0x0
+```
+
+`svcSetResourceLimitLimitValue` only refuses values below the current usage, so raising is always allowed, and every process starts with its own limit object, so no other process is affected. A control with a normal limit (usually 64) is not touched at all.
+
 ### Diagnosing a client that never connects
 
 2.1.7 makes SaltyNX Core (which runs inside the same process as the embedded app) print one line to `sdmc:/SaltySD/saltynx_core.log` right after it connects to `SaltySD`, and one more after it releases that session:

@@ -94,7 +94,7 @@ jobs:
               exit 1
             fi
           done
-          for marker in "probe[" "after-deinit"; do
+          for marker in "probe[" "after-deinit" "session limit"; do
             if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
               say "core marker present: $marker"
             else
