@@ -58,6 +58,35 @@ jobs:
       - name: Build
         run: make -j2
 
+      - name: Verify
+        run: |
+          set -eu
+          say() { echo "::notice::$1"; }
+          say "a64 gcc: $(aarch64-none-elf-gcc --version | head -1)"
+          say "arm gcc: $($DEVKITARM/bin/arm-none-eabi-gcc --version | head -1)"
+          for f in saltysd_bootstrap/saltynx_bootstrap.elf \
+                   saltysd_bootstrap/saltynx_bootstrap32.elf \
+                   saltysd_core/saltynx_core.elf \
+                   saltysd_core/saltynx_core32.elf \
+                   saltysd_proc/saltynx_proc.nsp \
+                   sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp; do
+            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+            say "$(stat -c%s "$f") B  $f"
+          done
+          if grep -aq "NethFPS" saltysd_proc/saltynx_proc.elf; then
+            say "NethFPS endpoint string is present in saltynx_proc.elf"
+          else
+            echo "::error::NethFPS endpoint string is missing from saltynx_proc.elf"
+            exit 1
+          fi
+          nsp=sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp
+          if grep -aq "NethFPS" "$nsp"; then
+            say "NethFPS endpoint string is present in exefs.nsp"
+          else
+            say "NethFPS not found literally in exefs.nsp (compressed NSO inside)"
+          fi
+          say "exefs.nsp size $(stat -c%s "$nsp") B sha256 $(sha256sum "$nsp" | cut -d' ' -f1)"
+
       - name: Package
         run: |
           set -eu
