@@ -110,26 +110,45 @@ SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms,
 
 Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
+### The handheld window is 50/55/60, never lower
+
+`updateRefreshRateForApp()` used to follow whatever the client published. Since 2.1.18 a measured target below 50 Hz is ignored in handheld mode and 50 is applied instead:
+
+```c
+if (!isDocked && requestedRate && check_refresh_rate < DISPLAY_SYNC_MIN_RATE)
+    check_refresh_rate = DISPLAY_SYNC_MIN_RATE;
+```
+
+The reason is the feedback loop described below: a slow scene publishes 45, the panel drops to 45, the compositor then paces the app at 45, and from that point a genuine 45 FPS game and a panel holding the app down are the same thing. Refusing to enter that state is cheaper than escaping it.
+
+```
+SaltyNX: display-sync: ignoring the 45 Hz target, this sync never goes below 50 Hz
+```
+
+The clamp only applies to a target the display-sync client *measured*. A rate set by hand - FPSLocker, or the legacy `SetDisplayRefreshRate` path NetherSX2 uses at startup - is not derived from a measurement and is left alone, so a 45 FPS game can still be pinned to 45 on purpose. Docked mode keeps its own allowlist.
+
+Consequence worth knowing: a game that genuinely cannot fill 50 FPS gets a 50 Hz panel and the judder that implies. That is a deliberate trade - the alternative is a panel that silently camps at 45 and never comes back.
+
 ### A drop can lock itself in
 
 A drop is the only direction that can become permanent. The panel slows down, the compositor then paces the app at the new rate, the app measures that same rate and publishes it, and the loop has no way to tell a game that genuinely runs at 45 from a panel that dragged it down to 45. By the time the value is measured it is genuinely true, so the rate stays until it is set by hand. That is the failure users hit as "sync locked my game at 45 FPS and I have to turn it off and set 50 myself".
 
 A rise cannot get stuck that way, because the app can always correct it down. So the way out is to walk the panel back up once and watch what the app does:
 
-- an applied *small drop* (at most 5 Hz) arms one test;
+- an applied drop *to the 50 Hz floor* arms one test (a drop between 60/55/50 above the floor is a real one, not a lock-in);
 - after 10 s with nothing changing, the panel is moved back to the rate it just left, for up to 12 s;
 - if the published target follows upward, the low reading was the panel's ceiling and the higher rate is kept;
 - if it does not, the game really cannot fill the panel, the old rate is restored and that rate is never tested again for this app.
 
 ```
-SaltyNX: display-sync: testing 45 Hz against 50 Hz, which the app held before
-SaltyNX: display-sync: 45 Hz was locked in, target followed to 50 Hz (active 50 Hz)
+SaltyNX: display-sync: testing 50 Hz against 55 Hz, which the app held before
+SaltyNX: display-sync: 50 Hz was locked in, target followed to 55 Hz (active 55 Hz)
 ```
 
 or
 
 ```
-SaltyNX: display-sync: 45 Hz is real, back from the test (target 45 Hz, active 45 Hz)
+SaltyNX: display-sync: 50 Hz is real, back from the test (target 50 Hz, active 50 Hz)
 ```
 
 At most three tests run per session, so a game that wobbles on the boundary cannot ping-pong the panel forever. The test returns to the rate the panel was actually on, not to the highest rate ever seen. The 60 Hz a client publishes before the game starts would otherwise send the panel to 60 for the whole test. A game that never dropped from a higher rate is never tested, and a rate that failed once is never tried again in the same session.

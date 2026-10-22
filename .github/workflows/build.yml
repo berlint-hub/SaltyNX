@@ -90,7 +90,8 @@ jobs:
                         "hides the command id" \
                         "target held" \
                         "integer refresh rates" \
-                        "which the app held before"; do
+                        "which the app held before" \
+                        "never goes below"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else

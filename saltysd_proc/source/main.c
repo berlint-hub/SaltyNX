@@ -264,6 +264,16 @@ void checkIfDmntChtNeedsToBeActive() {
 #define REFRESH_RATE_DEADBAND_HZ   1u
 #define SV_TICKS_PER_MS        19200ULL
 
+// Display sync is not allowed to take the handheld panel below this. The client
+// derives its target from a measured cadence, so a slow scene publishes 45 - and once
+// the panel sits at 45 the loop cannot tell that from a game that really runs at 45,
+// because by then it does. 50/55/60 is the whole window this sync may use.
+//
+// A rate set by hand (FPSLocker, the legacy SetDisplayRefreshRate path) is not derived
+// from a measurement and is left alone, so a 45 FPS game can still be pinned to 45
+// deliberately - it just cannot drift there on its own.
+#define DISPLAY_SYNC_MIN_RATE 50u
+
 static uint32_t pendingRefreshRate = 0;
 static u64 pendingRefreshSince = 0;
 static u64 pendingRefreshRequired = 0;
@@ -294,6 +304,7 @@ static uint32_t probeFailedRate = 0;
 static uint32_t probeCount = 0;      // capped, so a game wobbling on the boundary
 static const uint32_t probeLimit = 3; // cannot ping-pong the panel forever
 static u64 sameRateSince = 0;
+static bool minRateClampLogged = false;
 
 void cleanAppData() {
     lastAppPID = -1;
@@ -307,6 +318,7 @@ void cleanAppData() {
     probeFailedRate = 0;
     probeCount = 0;
     sameRateSince = 0;
+    minRateClampLogged = false;
     uintptr_t shmem = (uintptr_t)shmemGetAddr(&_sharedMemory);
     if (shmem) {
         memset((void*)(shmem+4), 0, shmem_size-4);
@@ -341,6 +353,14 @@ void updateRefreshRateForApp() {
         uint32_t check_refresh_rate = requestedRate ? requestedRate : refreshRate;
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
+        if (!isDocked && requestedRate && check_refresh_rate < DISPLAY_SYNC_MIN_RATE) {
+            if (!minRateClampLogged) {
+                minRateClampLogged = true;
+                SaltyNX_printf(APP_NAME ": display-sync: ignoring the %u Hz target, this sync never goes below %u Hz\n",
+                               check_refresh_rate, DISPLAY_SYNC_MIN_RATE);
+            }
+            check_refresh_rate = DISPLAY_SYNC_MIN_RATE;
+        }
         if (check_refresh_rate != 60 && nx_fps && nx_fps->forceOriginalRefreshRate && (!isDocked || (isDocked && !dontForce60InDocked))) {
             check_refresh_rate = 60;
         }
@@ -420,12 +440,14 @@ void updateRefreshRateForApp() {
                     SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms)\n",
                                    temp_refreshRate, check_refresh_rate, heldMs);
                 pendingRefreshRate = 0;
-                // A small drop may be the panel dragging the app down rather than the
-                // app slowing down, and there is no way to tell the two apart after the
-                // fact. Arm one test that returns to the rate we just left.
+                // A drop to the floor is the only one worth second-guessing: below it
+                // there is no room left to move down, and the panel holding the app
+                // down looks exactly like a slow game. Arm one test back to the rate we
+                // just left; a drop between 60/55/50 above the floor is a real one.
                 probeArmed = (check_refresh_rate < temp_refreshRate) &&
+                             (check_refresh_rate == DISPLAY_SYNC_MIN_RATE) &&
                              (temp_refreshRate <= HandheldModeRefreshRateAllowed.max) &&
-                             (check_refresh_rate != probeFailedRate) &&
+                             (temp_refreshRate != probeFailedRate) &&
                              (probeCount < probeLimit);
                 if (probeArmed)
                     probeTarget = temp_refreshRate;
