@@ -110,6 +110,52 @@ SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms,
 
 Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
+### Any integer refresh rate, not just multiples of five
+
+`setPLLDHandheldRefreshRate()` used to do this:
+
+```c
+uint8_t base_refreshRate = new_refreshRate - (new_refreshRate % 5);
+uint32_t DIVN = (4 * base_refreshRate) / 10;
+```
+
+That truncation is a leftover, not a hardware limit. The PLLD supplies the panel pixel clock, and the refresh rate is that clock divided by `DSI_CLOCK_HZ / 60`:
+
+```
+pixelClock = 9375 * (4096 * (2 * DIVN + 1) + SDM_DIN) / (4 * DIVM * (1 << DIVP))
+refresh    = pixelClock / (DSI_CLOCK_HZ / 60)
+```
+
+With `DIVM = 1` and `DIVP = 1` that reduces to an exact integer equation:
+
+```
+refresh * 3328 == 8192 * DIVN + 4096 + SDM_DIN
+```
+
+so any integer rate has a solution: take the nearest `DIVN` and let the sigma-delta modulator absorb the remainder. One divider step is `8192 / 3328 = 2.46 Hz` and the modulator covers a full step (±4096), so nothing in 40..60 Hz is out of reach.
+
+Since 2.1.13 `plldSolveForRate()` does that, and the whole ladder is exact:
+
+| rate | DIVN | SDM_DIN |
+| --- | --- | --- |
+| 45 | 18 | −1792 |
+| 46 | 18 | +1536 |
+| 47 | 19 | −3328 |
+| 48 | 19 | **0** |
+| 49 | 19 | +3328 |
+| 50 | 20 | −1536 |
+
+48 Hz is the cleanest point of all - an exact integer divider with no fractional correction. The old code turned a 48 Hz request into `DIVN = 18` (45 Hz) with a `+8192` correction, which is half a step past the modulator's range, so the panel silently stayed at 45.
+
+Two related changes in the same version:
+
+- the readback rounds instead of truncating (`(pixelClock + DSI/120) / (DSI/60)`), so a rate never reads back one hertz low;
+- a target below the panel minimum now clamps to `HandheldModeRefreshRateAllowed.min` instead of jumping to 60 Hz, so 43 FPS content on an OLED gets 45 Hz rather than 60.
+
+Because 1 Hz granularity is now possible, `updateRefreshRateForApp()` ignores a 1 Hz difference outright - it is always measurement noise and never worth a mode switch.
+
+Still untouched: `correctOledGamma()` only knows 45/50/55/60. 50 and 55 share the same ELVSS values, so an in-between rate simply keeps what was last applied; nothing is restored.
+
 ### A client can lose its command id in the raw IPC header
 
 The raw payload of an IPC request does not start at `TLS+0x20`; it starts right after the header (`TLS+0x14` for a request that carries a PID descriptor), and the client declares its length in the second control word. If a client writes its payload at `TLS+0x20` but declares less than `0x0C+16` bytes, the kernel copies only the magic word and the command id never reaches the server.

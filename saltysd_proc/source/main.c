@@ -254,11 +254,14 @@ void checkIfDmntChtNeedsToBeActive() {
 //     the rate the app actually wants;
 //   * a small drop (50 -> 45) applies only after 20 s, because a sudden few-Hz drop
 //     is almost always one slow frame being measured, and dropping the panel costs a
-//     mode switch plus a slower picture.
+//     mode switch plus a slower picture;
+//   * a 1 Hz difference is ignored outright. Since 2.1.13 the panel can sit on any
+//     integer rate, so the measured value would otherwise walk 48/49/50 forever.
 #define REFRESH_RATE_SMALL_DELTA   5u
 #define REFRESH_RATE_SMALL_UP_MS   5000ULL
 #define REFRESH_RATE_SMALL_DOWN_MS 20000ULL
 #define REFRESH_RATE_LARGE_MS      1500ULL
+#define REFRESH_RATE_DEADBAND_HZ   1u
 #define SV_TICKS_PER_MS        19200ULL
 
 static uint32_t pendingRefreshRate = 0;
@@ -316,10 +319,15 @@ void updateRefreshRateForApp() {
         }
         if (temp_refreshRate != check_refresh_rate) {
             const u64 now = svcGetSystemTick();
-            if (check_refresh_rate != pendingRefreshRate) {
-                const uint32_t delta = (check_refresh_rate > temp_refreshRate)
-                                     ? (check_refresh_rate - temp_refreshRate)
-                                     : (temp_refreshRate - check_refresh_rate);
+            const uint32_t delta = (check_refresh_rate > temp_refreshRate)
+                                 ? (check_refresh_rate - temp_refreshRate)
+                                 : (temp_refreshRate - check_refresh_rate);
+            if (delta <= REFRESH_RATE_DEADBAND_HZ) {
+                // One hertz is below what the eye resolves and costs a full mode
+                // switch, so it is always measurement noise, never an intent.
+                pendingRefreshRate = 0;
+            }
+            else if (check_refresh_rate != pendingRefreshRate) {
                 u64 requiredMs = REFRESH_RATE_LARGE_MS;
                 if (delta <= REFRESH_RATE_SMALL_DELTA)
                     requiredMs = (check_refresh_rate > temp_refreshRate)
@@ -525,9 +533,12 @@ void Initialize() {
             svcCloseHandle(saltyportDisplaySync);
             saltyportDisplaySync = INVALID_HANDLE;
         }
-        else
+        else {
             SaltyNX_printf(APP_NAME " " APP_VERSION ": display-sync endpoint ready (%s, %d sessions, handle 0x%x)\n",
                            DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS, saltyportDisplaySync);
+            SaltyNX_printf(APP_NAME ": display-sync: integer refresh rates enabled (%u..%u Hz, 1 Hz deadband)\n",
+                           HandheldModeRefreshRateAllowed.min, HandheldModeRefreshRateAllowed.max);
+        }
     }
 }
 
