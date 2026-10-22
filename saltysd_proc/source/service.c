@@ -1277,26 +1277,44 @@ void serviceThread()
  * process can get OutOfResource when it tries to connect on its own. This endpoint
  * serves only the two commands such a client needs and never touches the SD card
  * tables, the process list or the refresh rate, so it is safe to run on its own
- * thread next to serviceThread(). */
+ * thread next to serviceThread().
+ *
+ * Logging here is deliberately verbose about failures only: a client that gets no
+ * reply just blocks, so the reason has to be visible in saltynx.log. */
 void serviceThreadDisplaySync(void* portHandle)
 {
     const Handle port = (Handle)(uintptr_t)portHandle;
-    bool client_seen = false;
+    Result lastAcceptRc = 0;
+    bool clientSeen = false;
+
+    SERVICE_LOG("waiting for a client on the display-sync port");
 
     while (1)
     {
         Handle session;
         Result ret = svcAcceptSession(&session, port);
+
         if (R_FAILED(ret))
         {
-            svcSleepThread(1000 * 1000);
+            // Report every distinct failure once instead of spamming the log.
+            if (ret != lastAcceptRc)
+            {
+                SERVICE_LOG("accept failed: 0x%x", ret);
+                lastAcceptRc = ret;
+            }
+            svcSleepThread(100 * 1000);
             continue;
         }
 
-        if (!client_seen)
+        if (lastAcceptRc)
+        {
+            SERVICE_LOG("accept recovered after 0x%x", lastAcceptRc);
+            lastAcceptRc = 0;
+        }
+        if (!clientSeen)
         {
             SERVICE_LOG("display-sync client connected");
-            client_seen = true;
+            clientSeen = true;
         }
 
         Handle replySession = 0;
@@ -1304,7 +1322,11 @@ void serviceThreadDisplaySync(void* portHandle)
         {
             int handle_index = 0;
             ret = svcReplyAndReceive(&handle_index, &session, 1, replySession, UINT64_MAX);
-            if (R_FAILED(ret)) break;
+            if (R_FAILED(ret))
+            {
+                SERVICE_LOG("session finished: 0x%x", ret);
+                break;
+            }
 
             IpcParsedCommand r = {0};
             ipcParse(&r);
@@ -1324,7 +1346,7 @@ void serviceThreadDisplaySync(void* portHandle)
                     handleServiceCmd((int)resp->command);
                     break;
                 default: {
-                    SERVICE_LOG("display-sync: unsupported command 0x%lx", resp->command);
+                    SERVICE_LOG("unsupported command 0x%lx", resp->command);
                     IpcCommand c;
                     ipcInitialize(&c);
                     struct {

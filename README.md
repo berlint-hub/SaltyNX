@@ -54,6 +54,30 @@ After mapping the shared block, a client finds the NX-FPS/FPSLocker block by the
 
 Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berlint-hub/NetherSX2_nx).
 
+### Verifying the endpoint
+
+Right after boot, `sdmc:/SaltySD/saltynx.log` (written when `SaltySD/flags/log.flag` exists) has to contain the version line and these three lines from the sysmodule itself:
+
+```
+SaltyNX 2.1.4: got SD card.
+SaltyNX: display-sync endpoint ready (NethFPS)
+SaltyNX: display-sync self-test OK (rate 0, 0 before a game runs)
+```
+
+The self-test connects to the port at boot and performs one `GetDisplayRefreshRate` request through it, so a working log means the endpoint really serves requests. If the self-test fails, it prints the kernel result code instead.
+
+When a client then connects, `SaltyNX: [serviceThreadDisplaySync] display-sync client connected` shows up. Failures are logged once per distinct code, so a silent log really means "nothing tried to connect".
+
+Result codes a client sees when it connects to `NethFPS`:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `0` | - | connected |
+| `0xF201` | `KernelError_NotFound` | no such port: an older sysmodule is running, or the port could not be created (see the log) |
+| `0x10801` | `KernelError_OutOfResource` | the port exists but another client holds its only session |
+
+Note that `OutOfResource` on the *legacy* port is normal while a game runs, because Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
+
 # How to install release:
 
 Download newest version from [RELEASES](https://github.com/masagrator/SaltyNX/releases), look for .zip file with name starting "SaltyNX", unpack it.
