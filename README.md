@@ -157,18 +157,21 @@ Everything else still applies, with two exceptions:
 | target source | client's `FPSlocked` (5 Hz table) | NX-FPS `FPSavg` (measured, 1 Hz) |
 | floor | 50 Hz | the panel's own minimum (45 Hz on OLED) |
 | deadband | 1 Hz | 0 - a one hertz change is the point |
-| rise / drop / large | 5 s / 20 s / 1.5 s | unchanged |
+| rise / drop / large | 5 s / 20 s / 1.5 s | 4 s / 4 s / 1.5 s |
+| measurement | client's number, used as is | one sample a second, jumping ones refused, the rest smoothed |
 | lock-in test | armed on a drop to the floor | disabled (the loop is the point) |
 
 Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is zero before the first presented frame, so "not measuring yet" must not move the panel.
 
+A client publishes that number as a whole hertz, once a second, from a window of sixteen frames. A single hitch - a stalled worker thread, a disc read that blocked for 2.6 s - inflates the mean interval enough to report five hertz low for one second and then snap back. Fine mode cannot build a one-hertz decision on that, so it takes one sample a second, refuses any that jump more than 2 Hz, and averages the rest with a 0.35 coefficient (about three seconds). Ten refusals in a row is not noise any more - that is a new scene or a new app - so the average restarts from the new value instead of sitting on a stale one. That is also what stops a lock from surviving a scene change.
+
 Fine mode is only as good as the measurement behind it, and that is the open question. `FPSavg` is written from NX-FPS's present hook, which is installed by rewriting the game's import table - a game that resolves `vkQueuePresentKHR` at runtime, the way a Vulkan wrapper does, never calls the hooked copy. When that happens the shared field keeps its initial 255 and fine mode silently does nothing, which looks exactly like "the panel just did not want to move".
 
-Since 2.1.22 the answer is printed every ten seconds while the flag is present:
+Since 2.1.22 the answer is printed while the flag is present (every ten seconds, every thirty from 2.1.23):
 
 ```
-SaltyNX: fine: block=found FPS=50 FPSavg=49.87 target=50 panel=50
-SaltyNX: fine: block=found FPS=0 FPSavg=255.00 target=0 panel=50
+SaltyNX: fine: block=found FPS=0 FPSavg=50.00 smooth=50.13 target=50 panel=50
+SaltyNX: fine: block=found FPS=0 FPSavg=0.00 smooth=0.00 target=0 panel=50
 ```
 
 `FPSavg=0.00` means the hook never ran and fine mode has no measurement to follow. `target=0` is the consequence - the normal path takes over, floor and all. Since 2.1.23 that is also said once, fifteen seconds in, instead of leaving it to be inferred:
@@ -177,7 +180,7 @@ SaltyNX: fine: block=found FPS=0 FPSavg=255.00 target=0 panel=50
 SaltyNX: fine: no measurement after 15 s (FPS=0 FPSavg=0.00) - the NX-FPS present hook is not running for this app, falling back to the client target
 ```
 
-**Confirmed on the device:** NetherSX2 reports `block=found FPS=0 FPSavg=0.00` for a whole session. NX-FPS rewrites the game's import table, and a Vulkan wrapper resolves `vkQueuePresentKHR` through `vk_icdGetInstanceProcAddr` instead, so the hooked copy is never called. The NX-FPS fields are therefore free real estate in that process, and the client can fill them: writing its own measured rate into `FPSavg` (offset 5 of the packed block) is a three-line change on the client side and makes fine mode work unchanged.
+**Confirmed on the device, both ways.** Before the client patch NetherSX2 reported `block=found FPS=0 FPSavg=0.00` for a whole session. NX-FPS rewrites the game's import table, and a Vulkan wrapper resolves `vkQueuePresentKHR` through `vk_icdGetInstanceProcAddr` instead, so the hooked copy is never called. The NX-FPS fields are therefore free real estate in that process, and the client can fill them: writing its own measured rate into `FPSavg` (offset 5 of the packed block) is a three-line change on the client side and makes fine mode work unchanged. With that patch in place the same log reads `FPSavg=50.00 target=50`, the panel moves 60 -> 50 Hz in 1556 ms with the `, measured` suffix, and then stays there: over fifteen minutes of Gran Turismo 3 the one-second samples wandered between 44 and 51 while the panel never left 50.
 
 This is the experiment, not a default. It can drop the panel below 50, which is exactly what the normal mode forbids, and it follows a measurement that includes the panel's own influence - the loop that made 2.1.16 necessary still exists here, it is just being asked to do something useful instead of something harmful.
 

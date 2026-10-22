@@ -261,6 +261,7 @@ void checkIfDmntChtNeedsToBeActive() {
 #define REFRESH_RATE_SMALL_UP_MS   5000ULL
 #define REFRESH_RATE_SMALL_DOWN_MS 20000ULL
 #define REFRESH_RATE_LARGE_MS      1500ULL
+#define REFRESH_RATE_FINE_MS       4000ULL
 #define REFRESH_RATE_DEADBAND_HZ   1u
 #define SV_TICKS_PER_MS        19200ULL
 
@@ -344,8 +345,9 @@ static bool testSweepDone = false;
 //
 //     sdmc:/SaltySD/flags/sync_fine.flag        (create, then reboot)
 //
-// Everything else still applies - the 5 s rise, the 20 s drop, the large-change 1.5 s -
-// except the 1 Hz deadband, which has to go or nothing would ever move by one.
+// The 1 Hz deadband has to go or nothing would ever move by one, and the 20 s drop is
+// pointless once the target itself only moves by a hertz: a real one-hertz change is
+// followed in 4 s, a large swing still gets the 1.5 s treatment.
 #define FINE_SYNC_FILE "sdmc:/SaltySD/flags/sync_fine.flag"
 
 static bool fineSyncEnabled = false;
@@ -356,15 +358,66 @@ static void loadFineSyncFlag() {
         SaltyNX_printf(APP_NAME ": fine sync enabled from " FINE_SYNC_FILE ", following the measured rate to the hertz\n");
 }
 
-// Returns 0 when there is nothing trustworthy to follow.
-static uint32_t fineMeasuredTarget() {
-    if (!nx_fps)
-        return 0;
+// A client publishes FPSavg as a whole number, once a second, from a window of
+// sixteen frames. One hitch - a stalled worker thread, a 2.6 s blocking read -
+// inflates the mean interval enough to drag that number down by five hertz for a
+// whole second, and the next second it is back. A one-hertz target cannot follow
+// that, so the samples are gated to one per second, the ones that jump are
+// refused, and the rest are averaged. Ten refusals in a row is not noise any
+// more, that is a different app or a different scene, so the average restarts
+// from the new value.
+#define FINE_SAMPLE_MS   900ULL
+#define FINE_SMOOTHING   0.35f
+#define FINE_REJECT_HZ   2.0f
+#define FINE_REJECT_MAX  10u
+
+static float fineAvg = 0.0f;
+static bool fineAvgValid = false;
+static u64 fineSampleTick = 0;
+static uint32_t fineRejects = 0;
+
+static void fineSampleMeasurement() {
+    if (!fineSyncEnabled || isDocked || !nx_fps) {
+        fineAvgValid = false;
+        fineRejects = 0;
+        return;
+    }
+    const u64 now = svcGetSystemTick();
+    if (fineSampleTick && now - fineSampleTick < FINE_SAMPLE_MS * SV_TICKS_PER_MS)
+        return;
+    fineSampleTick = now;
+
     const float avg = nx_fps->FPSavg;
     // FPSavg starts at 255 in NX-FPS and stays 0 before the first PostFrame, so
     // anything outside a plausible range means "not measuring yet".
-    if (!(avg >= 30.0f && avg <= 240.0f))
+    if (!(avg >= 30.0f && avg <= 240.0f)) {
+        fineAvgValid = false;
+        fineAvg = 0.0f;
+        fineRejects = 0;
+        return;
+    }
+    if (!fineAvgValid) {
+        fineAvg = avg;
+        fineAvgValid = true;
+        fineRejects = 0;
+        return;
+    }
+    if (avg < fineAvg - FINE_REJECT_HZ || avg > fineAvg + FINE_REJECT_HZ) {
+        if (++fineRejects >= FINE_REJECT_MAX) {
+            fineAvg = avg;
+            fineRejects = 0;
+        }
+        return;
+    }
+    fineRejects = 0;
+    fineAvg += (avg - fineAvg) * FINE_SMOOTHING;
+}
+
+// Returns 0 when there is nothing trustworthy to follow.
+static uint32_t fineMeasuredTarget() {
+    if (!fineAvgValid)
         return 0;
+    const float avg = fineAvg;
     uint32_t target = (uint32_t)(avg + 0.5f);
     if (target < HandheldModeRefreshRateAllowed.min)
         target = HandheldModeRefreshRateAllowed.min;
@@ -490,6 +543,7 @@ void updateRefreshRateForApp() {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
+        fineSampleMeasurement();
         const uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
         if (fineSyncEnabled && !isDocked) {
             // Fine mode is only as good as the measurement behind it. NX-FPS installs
@@ -521,10 +575,12 @@ void updateRefreshRateForApp() {
             if (nowFine - lastFineLog >= 30000ULL * SV_TICKS_PER_MS) {
                 lastFineLog = nowFine;
                 const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
-                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u target=%u panel=%u\n",
+                const uint32_t smooth_x100 = (uint32_t)(fineAvg * 100.0f);
+                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u smooth=%u.%02u target=%u panel=%u\n",
                                nx_fps ? "found" : "missing",
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
+                               smooth_x100 / 100, smooth_x100 % 100,
                                measured, temp_refreshRate);
             }
         }
@@ -608,7 +664,11 @@ void updateRefreshRateForApp() {
                 // sample right after a gameplay stretch and the panel would visibly jump
                 // to 60 and straight back.
                 u64 requiredMs;
-                if (check_refresh_rate > temp_refreshRate)
+                if (fineRate)
+                    requiredMs = (delta <= REFRESH_RATE_SMALL_DELTA)
+                               ? REFRESH_RATE_FINE_MS
+                               : REFRESH_RATE_LARGE_MS;
+                else if (check_refresh_rate > temp_refreshRate)
                     requiredMs = REFRESH_RATE_SMALL_UP_MS;
                 else if (delta <= REFRESH_RATE_SMALL_DELTA)
                     requiredMs = REFRESH_RATE_SMALL_DOWN_MS;
