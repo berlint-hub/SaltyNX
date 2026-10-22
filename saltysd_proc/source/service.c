@@ -1269,3 +1269,77 @@ void serviceThread()
     
     SaltyNX_printf(APP_NAME ": done accepting service calls\n");
 }
+
+
+/* Dedicated endpoint for display-sync clients (f.e. NetherSX2) running inside the
+ * hijacked process. The legacy SaltySD port accepts one client at a time and that
+ * slot is used by SaltyNX Core while it bootstraps, so an app living in the same
+ * process can get OutOfResource when it tries to connect on its own. This endpoint
+ * serves only the two commands such a client needs and never touches the SD card
+ * tables, the process list or the refresh rate, so it is safe to run on its own
+ * thread next to serviceThread(). */
+void serviceThreadDisplaySync(void* portHandle)
+{
+    const Handle port = (Handle)(uintptr_t)portHandle;
+    bool client_seen = false;
+
+    while (1)
+    {
+        Handle session;
+        Result ret = svcAcceptSession(&session, port);
+        if (R_FAILED(ret))
+        {
+            svcSleepThread(1000 * 1000);
+            continue;
+        }
+
+        if (!client_seen)
+        {
+            SERVICE_LOG("display-sync client connected");
+            client_seen = true;
+        }
+
+        Handle replySession = 0;
+        while (1)
+        {
+            int handle_index = 0;
+            ret = svcReplyAndReceive(&handle_index, &session, 1, replySession, UINT64_MAX);
+            if (R_FAILED(ret)) break;
+
+            IpcParsedCommand r = {0};
+            ipcParse(&r);
+
+            struct
+            {
+                u64 magic;
+                u64 command;
+                u64 reserved[2];
+            } *resp = r.Raw;
+
+            switch (resp->command) {
+                // Both replies are produced by handleServiceCmd, so this endpoint stays
+                // byte-for-byte identical with the legacy SaltySD one.
+                case handleService_GetDisplayRefreshRate:
+                case handleService_GetSharedMemoryHandle:
+                    handleServiceCmd((int)resp->command);
+                    break;
+                default: {
+                    SERVICE_LOG("display-sync: unsupported command 0x%lx", resp->command);
+                    IpcCommand c;
+                    ipcInitialize(&c);
+                    struct {
+                        u64 magic;
+                        u64 result;
+                    } *raw = ipcPrepareHeader(&c, sizeof(*raw));
+                    raw->magic = SFCO_MAGIC;
+                    raw->result = 0xEE01;
+                    break;
+                }
+            }
+
+            replySession = session;
+        }
+
+        svcCloseHandle(session);
+    }
+}

@@ -15,6 +15,12 @@
 #define MODULE_SALTYNX 420
 #define NVDISP_PANEL_GET_VENDOR_ID 0xC003021A
 
+// Second IPC port for display-sync clients (NetherSX2). The name must match the client,
+// which has it compiled in as "NethFPS".
+#ifndef DISPLAY_SYNC_PORT_NAME
+#define DISPLAY_SYNC_PORT_NAME "NethFPS"
+#endif
+
 u32 __nx_fs_num_sessions = 1;
 
 const size_t shmem_size = 0x1000;
@@ -28,7 +34,9 @@ struct MinMax {
     u8 max;
 };
 
-Handle saltyport, sdcard, injectserv;
+Handle saltyport, saltyportDisplaySync, sdcard, injectserv;
+static Thread displaySyncThread;
+static u8 displaySyncThreadStack[0x6000] __attribute__((aligned(0x1000)));
 static char g_heap[0x30000];
 bool already_hijacking = false;
 bool should_terminate = false;
@@ -415,6 +423,12 @@ void Initialize() {
     // Start our port
     // For some reason, we only have one session maximum (0 reslimit handle related?)	
     svcManageNamedPort(&saltyport, "SaltySD", 1);
+    // Second, single-session port for display-sync clients living inside the hijacked
+    // process. SaltySD accepts one client at a time and Core uses that slot while it
+    // bootstraps, so an app running in the same process can get OutOfResource there.
+    Result displaySyncPortRc = svcManageNamedPort(&saltyportDisplaySync, DISPLAY_SYNC_PORT_NAME, 1);
+    if (R_FAILED(displaySyncPortRc))
+        SaltyNX_printf(APP_NAME ": failed to create the display-sync port: 0x%x\n", displaySyncPortRc);
     svcManageNamedPort(&injectserv, "InjectServ", 1);
 
     uint64_t dummy = 0;
@@ -433,6 +447,19 @@ void Initialize() {
     shmemCreate(&_sharedMemory, shmem_size, Perm_Rw, Perm_Rw);
     shmemMap(&_sharedMemory);
     memset(shmemGetAddr(&_sharedMemory), 0, shmem_size);
+
+    if (R_SUCCEEDED(displaySyncPortRc)) {
+        Result threadRc = threadCreate(&displaySyncThread, serviceThreadDisplaySync,
+                                       (void*)(uintptr_t)saltyportDisplaySync,
+                                       displaySyncThreadStack, sizeof(displaySyncThreadStack),
+                                       0x3B, -2);
+        if (R_SUCCEEDED(threadRc))
+            threadRc = threadStart(&displaySyncThread);
+        if (R_FAILED(threadRc))
+            SaltyNX_printf(APP_NAME ": display-sync thread failed to start: 0x%x\n", threadRc);
+        else
+            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s)\n", DISPLAY_SYNC_PORT_NAME);
+    }
 }
 
 int main(int argc, char *argv[])

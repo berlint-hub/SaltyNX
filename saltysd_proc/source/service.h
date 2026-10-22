@@ -9,6 +9,7 @@ struct DirId {
 };
 
 void serviceThread();
+void serviceThreadDisplaySync(void* portHandle);
 extern size_t openedFilesAmount;
 extern struct FileId openedFilesArray[FOPEN_MAX-1];
 extern size_t openedDirsAmount;

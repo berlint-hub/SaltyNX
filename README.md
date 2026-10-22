@@ -37,6 +37,23 @@ Patches pattern:
 
 Examples of such patches can be find [HERE](https://github.com/masagrator/SaltyNX-Patches).
 
+# Display sync from homebrew
+
+Homebrew that wants to drive SaltyNX display sync (an emulator keeping the panel at the rate it presents at, for example) can use a second IPC port named `NethFPS`. It is served by its own thread and lives next to the legacy `SaltySD` port, which accepts one client at a time - inside a hijacked process that slot is used by SaltyNX Core while it bootstraps, so a second client running there can get `OutOfResource` when it tries to use `SaltySD` directly.
+
+The port accepts only these commands, with the same wire format as `SaltySD`:
+
+| Command | ID | Reply |
+| --- | --- | --- |
+| `GetDisplayRefreshRate` | 10 | `magic`, `result`, current refresh rate |
+| `GetSharedMemoryHandle` | 7 | Handle of the 0x1000 B shared memory block |
+
+Anything else is answered with `0xEE01`. A client that already speaks `SaltySD` needs no other change than the port name.
+
+After mapping the shared block, a client finds the NX-FPS/FPSLocker block by the `0x465053` magic (it sits at the start of the block) and writes `FPSlocked`, which is byte 10 of that block. SaltyNX then sets the panel to the matching refresh rate while display sync is enabled (`sdmc:/SaltySD/flags/displaysync.flag` or the `SetDisplaySync` command), exactly like FPSLocker does. Note that SaltyNX does not inject Core into homebrew applications, so this only works for homebrew installed and launched as a title.
+
+Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berlint-hub/NetherSX2_nx).
+
 # How to install release:
 
 Download newest version from [RELEASES](https://github.com/masagrator/SaltyNX/releases), look for .zip file with name starting "SaltyNX", unpack it.
