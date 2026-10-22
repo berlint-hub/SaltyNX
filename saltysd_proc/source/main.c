@@ -268,6 +268,32 @@ static uint32_t pendingRefreshRate = 0;
 static u64 pendingRefreshSince = 0;
 static u64 pendingRefreshRequired = 0;
 
+// A drop is the one direction that can feed itself to death. The panel slows down, the
+// compositor then paces the app at the new rate, the app measures that same rate and
+// keeps publishing it, so nothing in the loop can tell a genuine 45 FPS game from a
+// panel that dragged it to 45. It stays there until somebody sets the rate by hand.
+//
+// The way out uses information the loop already has: the highest rate the app ever
+// asked for. If the app published 50 and we later sit at 45, then 45 is below what the
+// app has demonstrated it can do, so it is worth one test. Walk the panel back up to
+// that demonstrated rate and watch whether the app follows. If it does, the low
+// reading was the panel's ceiling and the higher rate is kept. If it does not, the game
+// really cannot fill the panel, the old rate is restored, and that rate is never tested
+// again for this app.
+//
+// Only a rate the app actually asked for counts. The 60 Hz default that stands in for
+// "no target yet" must not, or every launch would probe away from its real rate.
+#define PROBE_HOLD_MS    10000ULL
+#define PROBE_WINDOW_MS  12000ULL
+
+static bool probeArmed = false;      // last applied change went below the demonstrated max
+static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
+static uint32_t probeTarget = 0;
+static u64 probeStart = 0;
+static uint32_t probeFailedRate = 0;
+static uint32_t highestRequestedRate = 0;
+static u64 sameRateSince = 0;
+
 // Testing hook: sdmc:/SaltySD/flags/refresh_rate.txt holding one integer drives the
 // panel to exactly that rate and ignores every other source. Without a client that
 // can publish a non-standard target this is the only way to answer "does my panel
@@ -314,6 +340,12 @@ void cleanAppData() {
     cheatCheck = false;
     pendingRefreshRate = 0;
     pendingRefreshRequired = 0;
+    probeArmed = false;
+    probeFromRate = 0;
+    probeTarget = 0;
+    probeFailedRate = 0;
+    highestRequestedRate = 0;
+    sameRateSince = 0;
     uintptr_t shmem = (uintptr_t)shmemGetAddr(&_sharedMemory);
     if (shmem) {
         memset((void*)(shmem+4), 0, shmem_size-4);
@@ -361,8 +393,10 @@ void updateRefreshRateForApp() {
     else if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
-        uint32_t check_refresh_rate = refreshRate;
-        if (nx_fps && (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked)) check_refresh_rate = (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked);
+        uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
+        if (requestedRate > highestRequestedRate)
+            highestRequestedRate = requestedRate;
+        uint32_t check_refresh_rate = requestedRate ? requestedRate : refreshRate;
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
         if (check_refresh_rate != 60 && nx_fps && nx_fps->forceOriginalRefreshRate && (!isDocked || (isDocked && !dontForce60InDocked))) {
@@ -374,11 +408,48 @@ void updateRefreshRateForApp() {
                 check_refresh_rate = 60;
             }
         }
-        if (temp_refreshRate != check_refresh_rate) {
-            const u64 now = svcGetSystemTick();
+
+        const u64 now = svcGetSystemTick();
+
+        if (probeFromRate) {
+            // Testing upward: hold the panel still and watch what the app publishes.
+            if (check_refresh_rate > probeFromRate) {
+                uint32_t achieved = 0;
+                if (GetDisplayRefreshRate(&achieved, true))
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was locked in, target followed to %u Hz (active %u Hz)\n",
+                                   probeFromRate, check_refresh_rate, achieved);
+                else
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was locked in, target followed to %u Hz\n",
+                                   probeFromRate, check_refresh_rate);
+                probeFromRate = 0;
+                probeArmed = false;
+                sameRateSince = 0;
+                pendingRefreshRate = 0;
+            }
+            else if (check_refresh_rate < probeFromRate || now - probeStart >= PROBE_WINDOW_MS * SV_TICKS_PER_MS) {
+                uint32_t achieved = 0;
+                SetDisplayRefreshRate(probeFromRate);
+                probeFailedRate = probeFromRate;
+                if (GetDisplayRefreshRate(&achieved, true))
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz is real, back from the test (target %u Hz, active %u Hz)\n",
+                                   probeFromRate, check_refresh_rate, achieved);
+                else
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz is real, back from the test (target %u Hz)\n",
+                                   probeFromRate, check_refresh_rate);
+                probeFromRate = 0;
+                probeArmed = false;
+                sameRateSince = now;
+                pendingRefreshRate = 0;
+            }
+            else {
+                pendingRefreshRate = 0;
+            }
+        }
+        else if (temp_refreshRate != check_refresh_rate) {
             const uint32_t delta = (check_refresh_rate > temp_refreshRate)
                                  ? (check_refresh_rate - temp_refreshRate)
                                  : (temp_refreshRate - check_refresh_rate);
+            sameRateSince = 0;
             if (delta <= REFRESH_RATE_DEADBAND_HZ) {
                 // One hertz is below what the eye resolves and costs a full mode
                 // switch, so it is always measurement noise, never an intent.
@@ -407,10 +478,37 @@ void updateRefreshRateForApp() {
                     SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms)\n",
                                    temp_refreshRate, check_refresh_rate, heldMs);
                 pendingRefreshRate = 0;
+                // If this landed below a rate the app has asked for before, the drop
+                // may be the panel dragging the app down rather than the app slowing
+                // down. Arm one test for it.
+                probeArmed = (check_refresh_rate < highestRequestedRate) &&
+                             (highestRequestedRate <= HandheldModeRefreshRateAllowed.max) &&
+                             (check_refresh_rate != probeFailedRate);
+                if (probeArmed)
+                    probeTarget = highestRequestedRate;
             }
         }
         else {
             pendingRefreshRate = 0;
+            if (probeArmed && probeTarget > check_refresh_rate) {
+                if (sameRateSince == 0)
+                    sameRateSince = now;
+                else if (now - sameRateSince >= PROBE_HOLD_MS * SV_TICKS_PER_MS) {
+                    uint32_t up = (probeTarget > HandheldModeRefreshRateAllowed.max)
+                                ? HandheldModeRefreshRateAllowed.max
+                                : probeTarget;
+                    probeArmed = false;
+                    probeFromRate = check_refresh_rate;
+                    probeStart = now;
+                    sameRateSince = 0;
+                    SetDisplayRefreshRate(up);
+                    SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app asked for earlier\n",
+                                   check_refresh_rate, up);
+                }
+            }
+            else {
+                sameRateSince = 0;
+            }
         }
     }
     if (!isDocked && nx_fps && nx_fps->FPSlocked > HandheldModeRefreshRateAllowed.max) {

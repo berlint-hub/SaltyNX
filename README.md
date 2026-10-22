@@ -110,6 +110,31 @@ SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms,
 
 Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
+### A drop can lock itself in
+
+A drop is the only direction that can become permanent. The panel slows down, the compositor then paces the app at the new rate, the app measures that same rate and publishes it, and the loop has no way to tell a game that genuinely runs at 45 from a panel that dragged it down to 45. By the time the value is measured it is genuinely true, so the rate stays until it is set by hand. That is the failure users hit as "sync locked my game at 45 FPS and I have to turn it off and set 50 myself".
+
+A rise cannot get stuck that way, because the app can always correct it down. So the way out is to walk the panel back up once and watch what the app does:
+
+- the sysmodule remembers the highest rate the app has ever *asked for* (`highestRequestedRate`);
+- an applied change that lands below that rate arms one test;
+- after 10 s with nothing changing, the panel is moved back up to that rate for up to 12 s;
+- if the published target follows upward, the low reading was the panel's ceiling and the higher rate is kept;
+- if it does not, the game really cannot fill the panel, the old rate is restored and that rate is never tested again for this app.
+
+```
+SaltyNX: display-sync: testing 45 Hz against 50 Hz, which the app asked for earlier
+SaltyNX: display-sync: 45 Hz was locked in, target followed to 50 Hz (active 50 Hz)
+```
+
+or
+
+```
+SaltyNX: display-sync: 45 Hz is real, back from the test (target 45 Hz, active 45 Hz)
+```
+
+Only a rate the client actually published counts. The 60 Hz default that stands in for "no target yet" is deliberately excluded, otherwise every launch would test its way away from the correct rate. A 45 FPS game that never asked for more sees no test at all.
+
 ### Any integer refresh rate, not just multiples of five
 
 `setPLLDHandheldRefreshRate()` used to do this:
