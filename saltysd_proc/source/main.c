@@ -268,6 +268,28 @@ static uint32_t pendingRefreshRate = 0;
 static u64 pendingRefreshSince = 0;
 static u64 pendingRefreshRequired = 0;
 
+// Testing hook: sdmc:/SaltySD/flags/refresh_rate.txt holding one integer drives the
+// panel to exactly that rate and ignores every other source. Without a client that
+// can publish a non-standard target this is the only way to answer "does my panel
+// actually lock at 48 Hz?" - the log reports what the hardware ended up at.
+#define FORCED_RATE_FILE "sdmc:/SaltySD/flags/refresh_rate.txt"
+
+static uint32_t forcedRefreshRate = 0;
+static u64 lastForcedAttempt = 0;
+
+static void loadForcedRefreshRate() {
+    FILE* f = fopen(FORCED_RATE_FILE, "r");
+    if (!f)
+        return;
+    int value = 0;
+    if (fscanf(f, "%d", &value) == 1 && value >= 1 && value <= 240) {
+        forcedRefreshRate = (uint32_t)value;
+        SaltyNX_printf(APP_NAME ": forcing the panel to %u Hz from " FORCED_RATE_FILE "\n",
+                       forcedRefreshRate);
+    }
+    fclose(f);
+}
+
 void cleanAppData() {
     lastAppPID = -1;
     nx_fps = 0;
@@ -301,7 +323,24 @@ void cleanAppData() {
 }
 
 void updateRefreshRateForApp() {
-    if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
+    if (forcedRefreshRate) {
+        uint32_t current = 0;
+        const u64 now = svcGetSystemTick();
+        const bool stillOff = GetDisplayRefreshRate(&current, true) && current != forcedRefreshRate;
+        if (stillOff && (lastForcedAttempt == 0 || now - lastForcedAttempt >= 3000ULL * SV_TICKS_PER_MS)) {
+            lastForcedAttempt = now;
+            uint32_t achieved = 0;
+            SetDisplayRefreshRate(forcedRefreshRate);
+            if (GetDisplayRefreshRate(&achieved, true))
+                SaltyNX_printf(APP_NAME ": display-sync: forced %u Hz requested, active %u Hz\n",
+                               forcedRefreshRate, achieved);
+            else
+                SaltyNX_printf(APP_NAME ": display-sync: forced %u Hz requested, readback failed\n",
+                               forcedRefreshRate);
+        }
+        pendingRefreshRate = 0;
+    }
+    else if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t check_refresh_rate = refreshRate;
@@ -403,6 +442,7 @@ void Initialize() {
     ABORT_IF_FAILED(fsInitialize(), 2);
     ABORT_IF_FAILED(fsdevMountSdmc(), 3);
     SaltyNX_printf(APP_NAME " " APP_VERSION ": got SD card.\n");
+    loadForcedRefreshRate();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);

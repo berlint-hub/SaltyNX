@@ -156,6 +156,25 @@ Because 1 Hz granularity is now possible, `updateRefreshRateForApp()` ignores a 
 
 Still untouched: `correctOledGamma()` only knows 45/50/55/60. 50 and 55 share the same ELVSS values, so an in-between rate simply keeps what was last applied; nothing is restored.
 
+### Testing one arbitrary rate without a client
+
+Neither FPSLocker nor NetherSX2 can ask for a rate outside their own 5 Hz table, so there is no way to answer "does this panel lock at 48 Hz?" from the client side. Since 2.1.14 the sysmodule reads an optional file instead:
+
+```
+sdmc:/SaltySD/flags/refresh_rate.txt      # one integer, e.g. 48
+```
+
+While that file exists, the panel is driven to exactly that rate and every other source (FPSLocker block, display sync) is ignored. The first attempt and any retry are logged with the rate the hardware actually reports back:
+
+```
+SaltyNX: forcing the panel to 48 Hz from sdmc:/SaltySD/flags/refresh_rate.txt
+SaltyNX: display-sync: forced 48 Hz requested, active 48 Hz
+```
+
+`active` is read back from the PLLD registers, so it says what the panel is really running at, not what was requested. A value that never matches means the panel refused that clock - it retries (and logs) at most once every 3 s, so a log full of `forced 48 Hz requested, active 45 Hz` is itself the answer.
+
+Delete the file and reboot to go back to normal behaviour.
+
 ### A client can lose its command id in the raw IPC header
 
 The raw payload of an IPC request does not start at `TLS+0x20`; it starts right after the header (`TLS+0x14` for a request that carries a PID descriptor), and the client declares its length in the second control word. If a client writes its payload at `TLS+0x20` but declares less than `0x0C+16` bytes, the kernel copies only the magic word and the command id never reaches the server.

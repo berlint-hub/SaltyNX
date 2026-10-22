@@ -89,7 +89,8 @@ jobs:
                         "no client on port" "client PID" "session #" \
                         "hides the command id" \
                         "target held" \
-                        "integer refresh rates"; do
+                        "integer refresh rates" \
+                        "forcing the panel to"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else
