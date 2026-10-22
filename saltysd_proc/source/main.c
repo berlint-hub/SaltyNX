@@ -492,19 +492,40 @@ void updateRefreshRateForApp() {
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
         const uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
         if (fineSyncEnabled && !isDocked) {
-            // Fine mode is only as good as NX-FPS's present hook: if that hook never
-            // runs, FPSavg stays at its initial 255 and this whole mode is a no-op that
-            // looks identical to "the panel just did not move". Say so out loud.
+            // Fine mode is only as good as the measurement behind it. NX-FPS installs
+            // its present hook by rewriting the game's import table, so an app that
+            // resolves vkQueuePresentKHR at runtime - any Vulkan wrapper - never calls
+            // the hooked copy and FPSavg stays 0 forever. That is indistinguishable
+            // from "the panel just did not move" unless it is said out loud.
             static u64 lastFineLog = 0;
+            static u64 fineNoDataSince = 0;
+            static bool fineNoDataLogged = false;
             const u64 nowFine = svcGetSystemTick();
-            if (nowFine - lastFineLog >= 10000ULL * SV_TICKS_PER_MS) {
+            const uint32_t measured = fineMeasuredTarget();
+            if (measured) {
+                fineNoDataSince = 0;
+                fineNoDataLogged = false;
+            }
+            else if (nx_fps) {
+                if (fineNoDataSince == 0)
+                    fineNoDataSince = nowFine;
+                else if (!fineNoDataLogged && nowFine - fineNoDataSince >= 15000ULL * SV_TICKS_PER_MS) {
+                    fineNoDataLogged = true;
+                    const uint32_t avg_x100 = (uint32_t)(nx_fps->FPSavg * 100.0f);
+                    SaltyNX_printf(APP_NAME ": fine: no measurement after 15 s (FPS=%u FPSavg=%u.%02u) - "
+                                   "the NX-FPS present hook is not running for this app, "
+                                   "falling back to the client target\n",
+                                   (u32)nx_fps->FPS, avg_x100 / 100, avg_x100 % 100);
+                }
+            }
+            if (nowFine - lastFineLog >= 30000ULL * SV_TICKS_PER_MS) {
                 lastFineLog = nowFine;
                 const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
                 SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u target=%u panel=%u\n",
                                nx_fps ? "found" : "missing",
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
-                               fineMeasuredTarget(), temp_refreshRate);
+                               measured, temp_refreshRate);
             }
         }
         uint32_t check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);

@@ -171,7 +171,13 @@ SaltyNX: fine: block=found FPS=50 FPSavg=49.87 target=50 panel=50
 SaltyNX: fine: block=found FPS=0 FPSavg=255.00 target=0 panel=50
 ```
 
-`FPSavg=255.00` means the hook never ran and fine mode has no measurement to follow. `target=0` is the consequence - the normal path takes over, floor and all.
+`FPSavg=0.00` means the hook never ran and fine mode has no measurement to follow. `target=0` is the consequence - the normal path takes over, floor and all. Since 2.1.23 that is also said once, fifteen seconds in, instead of leaving it to be inferred:
+
+```
+SaltyNX: fine: no measurement after 15 s (FPS=0 FPSavg=0.00) - the NX-FPS present hook is not running for this app, falling back to the client target
+```
+
+**Confirmed on the device:** NetherSX2 reports `block=found FPS=0 FPSavg=0.00` for a whole session. NX-FPS rewrites the game's import table, and a Vulkan wrapper resolves `vkQueuePresentKHR` through `vk_icdGetInstanceProcAddr` instead, so the hooked copy is never called. The NX-FPS fields are therefore free real estate in that process, and the client can fill them: writing its own measured rate into `FPSavg` (offset 5 of the packed block) is a three-line change on the client side and makes fine mode work unchanged.
 
 This is the experiment, not a default. It can drop the panel below 50, which is exactly what the normal mode forbids, and it follows a measurement that includes the panel's own influence - the loop that made 2.1.16 necessary still exists here, it is just being asked to do something useful instead of something harmful.
 
