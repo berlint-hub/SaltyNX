@@ -479,6 +479,53 @@ double strtod(const char* str, char** endptr) {
 	return ((strtod_0)(strtod_ptr))(str, endptr);
 }
 
+/* Report what a client living inside the hijacked process really gets from the
+ * kernel. NetherSX2 logs nethfps_rc=0x10801 (KernelError_OutOfResource, which the
+ * kernel calls LimitReached) for every connect while the NethFPS endpoint is idle
+ * with four free session slots, so something other than the port is refusing the
+ * connection. These numbers separate the two candidates: a full port, or a process
+ * that cannot allocate a session for itself. Core runs in the same process as the
+ * embedded app, so it reports exactly the same thing the app would see. */
+#if defined(SWITCH32) || defined(OUNCE32)
+typedef u64 rl_value_t;
+#else
+typedef s64 rl_value_t;
+#endif
+/* LimitableResource_SessionCountMax in current libnx, LimitableResource_Sessions
+ * in the old libnx32_min header. */
+#define RL_SESSIONS ((LimitableResource)4)
+
+static void SaltySDCore_ProbePorts(const char* stage)
+{
+	Handle neth = INVALID_HANDLE;
+	Result nethRc = svcConnectToNamedPort(&neth, "NethFPS");
+	if (R_SUCCEEDED(nethRc)) svcCloseHandle(neth);
+
+	/* The legacy port has a single session and Core itself holds it right now, so
+	 * a failure here is expected and tells us which result code means "port full". */
+	Handle legacy = INVALID_HANDLE;
+	Result legacyRc = svcConnectToNamedPort(&legacy, "SaltySD");
+	if (R_SUCCEEDED(legacyRc)) svcCloseHandle(legacy);
+
+	u64 limitValue = 0;
+	Result limitRc = svcGetInfo(&limitValue, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0);
+	Handle limit = (Handle)limitValue;
+	rl_value_t cur = -1, max = -1;
+	if (R_SUCCEEDED(limitRc))
+	{
+		svcGetResourceLimitCurrentValue(&cur, limit, RL_SESSIONS);
+		svcGetResourceLimitLimitValue(&max, limit, RL_SESSIONS);
+		svcCloseHandle(limit);
+	}
+
+	u64 pid = 0;
+	svcGetProcessId(&pid, CUR_PROCESS_HANDLE);
+
+	SaltySDCore_printf(MODULE_NAME ": probe[%s] pid=%d nethfps=0x%x saltySD=0x%x sessions=%d/%d limitrc=0x%x\n",
+	                   stage, (int)pid, (unsigned)nethRc, (unsigned)legacyRc,
+	                   (int)cur, (int)max, (unsigned)limitRc);
+}
+
 int main(int argc, char *argv[])
 {
 	Result ret;
@@ -490,6 +537,8 @@ int main(int argc, char *argv[])
 	strtod_ptr = SaltySDCore_FindSymbolBuiltin("strtod");
 	ret = SaltySD_Init();
 	if (ret) goto fail;
+
+	SaltySDCore_ProbePorts("after-init");
 
 	SaltySDCore_printf(MODULE_NAME " " APP_VERSION ": restoring code...\n");
 	ret = SaltySD_Restore();
@@ -537,6 +586,22 @@ int main(int argc, char *argv[])
 
 	ret = SaltySD_Deinit();
 	if (ret) goto fail;
+
+	/* Core released the only session it held. Report whether a client living in
+	 * this process can finally open its own session - that is what the embedded
+	 * app retries once per second. Logging needs a session, so reconnect after the
+	 * check and release it again. */
+	{
+		Handle probe = INVALID_HANDLE;
+		Result probeRc = svcConnectToNamedPort(&probe, "NethFPS");
+		if (R_SUCCEEDED(probeRc)) svcCloseHandle(probe);
+
+		if (R_SUCCEEDED(SaltySD_Init()))
+		{
+			SaltySDCore_printf(MODULE_NAME ": probe[after-deinit] nethfps=0x%x\n", (unsigned)probeRc);
+			SaltySD_Deinit();
+		}
+	}
 	
 	setupELFHeap();
 	__libnx_exit(0);

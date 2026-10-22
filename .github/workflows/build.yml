@@ -87,10 +87,18 @@ jobs:
           say "toolbox.json version matches"
           for marker in "display-sync endpoint ready" "waiting for a client on port" \
                         "no client on port" "client PID" "session #"; do
-            if grep -aq "$marker" saltysd_proc/saltynx_proc.elf; then
+            if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else
               echo "::error::marker missing from saltynx_proc.elf: $marker"
+              exit 1
+            fi
+          done
+          for marker in "probe[" "after-deinit"; do
+            if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
+              say "core marker present: $marker"
+            else
+              echo "::error::marker missing from saltynx_core.elf: $marker"
               exit 1
             fi
           done

@@ -88,6 +88,19 @@ Result codes a client can see when it connects to `NethFPS`:
 | `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
 | `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
+### Diagnosing a client that never connects
+
+2.1.7 makes SaltyNX Core (which runs inside the same process as the embedded app) print one line to `sdmc:/SaltySD/saltynx_core.log` right after it connects to `SaltySD`, and one more after it releases that session:
+
+```
+SaltyNX Core: probe[after-init] pid=139 nethfps=0x0 saltySD=0xe01 sessions=1/1 limitrc=0x0
+SaltyNX Core: probe[after-deinit] nethfps=0x0
+```
+
+- `nethfps=0x0` means the endpoint is reachable from this very process, so a client failure in the same process is not a port problem. `0x10801` there means the process itself cannot allocate another session at that moment.
+- `saltySD=0xe01` is the expected answer while Core holds the only session of the legacy port (`KernelError_OutOfSessions`): it calibrates what "port full" looks like on the running kernel.
+- `sessions=<current>/<max>` is this process' session accounting (`LimitableResource_SessionCountMax`). If `max` is 1, only one session can exist in the hijacked process at a time, and a client that connects while Core is alive cannot get one.
+
 The `0x10801` case is the important one for diagnostics: the kernel looks the port name up *before* it reserves a session, so this code proves the endpoint exists and is reachable. Nothing on the SaltyNX side can fix it - the client process has to free session slots (or retry) itself.
 
 Note that a session error on the *legacy* `SaltySD` port is normal while a game runs, because SaltyNX Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
