@@ -1,4 +1,5 @@
 #include "shared.h"
+#include "display_sync.h"
 #include "ipc.h"
 #include <string.h>
 #include <stdlib.h>
@@ -1279,17 +1280,20 @@ void serviceThread()
  * tables, the process list or the refresh rate, so it is safe to run on its own
  * thread next to serviceThread().
  *
- * Logging here is deliberately verbose about failures only: a client that gets no
- * reply just blocks, so the reason has to be visible in saltynx.log. */
+ * Do not connect to this port from inside the sysmodule (f.e. as a boot self-test):
+ * a same-process client leaves the port with a session slot that never frees up, so
+ * every external client afterwards gets OutOfResource while accept only reports
+ * KernelError_NotFound. That is what the recovery below is for. */
 void serviceThreadDisplaySync(void* portHandle)
 {
-    const Handle port = (Handle)(uintptr_t)portHandle;
+    Handle port = (Handle)(uintptr_t)portHandle;
     Result lastAcceptRc = 0;
     Result lastSessionRc = 0;
     u32 sessions = 0;
-    bool clientSeen = false;
+    u32 notFoundRuns = 0;
+    u64 lastClientPid = 0;
 
-    SERVICE_LOG("waiting for a client on the display-sync port");
+    SERVICE_LOG("waiting for a client on port %s", DISPLAY_SYNC_PORT_NAME);
 
     while (1)
     {
@@ -1304,19 +1308,34 @@ void serviceThreadDisplaySync(void* portHandle)
                 SERVICE_LOG("accept failed: 0x%x", ret);
                 lastAcceptRc = ret;
             }
+
+            // NotFound: the port has no accept-able registration. Drop it and put the
+            // name back into the kernel so external clients are not left with a port
+            // that exists but can never hand out a session.
+            if (ret == 0xF201 && ++notFoundRuns >= 50)
+            {
+                notFoundRuns = 0;
+                Handle fresh = INVALID_HANDLE;
+                svcCloseHandle(port);
+                Result reRc = svcManageNamedPort(&fresh, DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS);
+                if (R_SUCCEEDED(reRc)) {
+                    port = fresh;
+                    saltyportDisplaySync = fresh;
+                    lastAcceptRc = 0;
+                    SERVICE_LOG("port %s re-registered", DISPLAY_SYNC_PORT_NAME);
+                }
+                else SERVICE_LOG("failed to re-register port %s: 0x%x", DISPLAY_SYNC_PORT_NAME, reRc);
+            }
+
             svcSleepThread(100 * 1000);
             continue;
         }
 
+        notFoundRuns = 0;
         if (lastAcceptRc)
         {
             SERVICE_LOG("accept recovered after 0x%x", lastAcceptRc);
             lastAcceptRc = 0;
-        }
-        if (!clientSeen)
-        {
-            SERVICE_LOG("display-sync client connected");
-            clientSeen = true;
         }
 
         Handle replySession = 0;
@@ -1326,8 +1345,8 @@ void serviceThreadDisplaySync(void* portHandle)
             ret = svcReplyAndReceive(&handle_index, &session, 1, replySession, UINT64_MAX);
             if (R_FAILED(ret))
             {
-                // A client closing its session ends every poll, so report only the first
-                // few and any change - this must not write to the SD card once per second.
+                // ConnectionClosed ends every poll of the client, so report the first few
+                // and any change - this must not write to the SD card once per second.
                 if (sessions < 3 || ret != lastSessionRc)
                     SERVICE_LOG("session finished: 0x%x", ret);
                 lastSessionRc = ret;
@@ -1337,6 +1356,12 @@ void serviceThreadDisplaySync(void* portHandle)
 
             IpcParsedCommand r = {0};
             ipcParse(&r);
+
+            if (r.HasPid && (u64)r.Pid != lastClientPid)
+            {
+                lastClientPid = (u64)r.Pid;
+                SERVICE_LOG("client PID %lu connected", lastClientPid);
+            }
 
             struct
             {

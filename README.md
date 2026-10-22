@@ -56,6 +56,36 @@ Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berli
 
 ### Verifying the endpoint
 
+`sdmc:/SaltySD/saltynx.log` (written when `SaltySD/flags/log.flag` exists) shows the endpoint coming up and every client it serves:
+
+```
+SaltyNX 2.1.5: got SD card.
+SaltyNX: display-sync endpoint ready (NethFPS, 4 sessions)
+SaltyNX: [serviceThreadDisplaySync] waiting for a client on port NethFPS
+SaltyNX: [serviceThreadDisplaySync] client PID 141 connected
+SaltyNX: [serviceThreadDisplaySync] session finished: 0xf601
+```
+
+`0xf601` is `KernelError_ConnectionClosed`: the client closed its session after the reply, which happens once per poll. Only the first few are logged, then only changes.
+
+Failures are logged once per distinct code, so a silent log really means "nothing tried to connect". If `accept` reports `0xf201` (`KernelError_NotFound`) for a full second, the endpoint drops the port handle and registers the name again, logging `port NethFPS re-registered`.
+
+Result codes a client sees when it connects to `NethFPS`:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `0` | - | connected |
+| `0xF201` | `KernelError_NotFound` | no such port: an older sysmodule is running |
+| `0x10801` | `KernelError_OutOfResource` | the port exists but all `DISPLAY_SYNC_SESSIONS` are taken |
+
+Note that `OutOfResource` on the *legacy* port is normal while a game runs, because Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
+
+Do not connect to this port from inside the sysmodule itself. A same-process loopback client (a boot-time self-test, for instance) leaves a session slot that never frees, after which every external client gets `OutOfResource` while `accept` only reports `NotFound`. Build 2.1.4 shipped such a self-test and broke the endpoint this way.
+
+Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berlint-hub/NetherSX2_nx).
+
+### Verifying the endpoint
+
 Right after boot, `sdmc:/SaltySD/saltynx.log` (written when `SaltySD/flags/log.flag` exists) has to contain the version line and these three lines from the sysmodule itself:
 
 ```

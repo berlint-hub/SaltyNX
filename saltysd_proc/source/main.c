@@ -10,18 +10,12 @@
 #include "dmntcht.h"
 #include <malloc.h>
 #include "service.h"
+#include "display_sync.h"
 #include "hijack.h"
 
 #define MODULE_SALTYNX 420
 #define NVDISP_PANEL_GET_VENDOR_ID 0xC003021A
 
-// Second IPC port for display-sync clients (NetherSX2). The name must match the client,
-// which has it compiled in as "NethFPS".
-#ifndef DISPLAY_SYNC_PORT_NAME
-#define DISPLAY_SYNC_PORT_NAME "NethFPS"
-#endif
-// handleService_GetDisplayRefreshRate from the service enum.
-#define DISPLAY_SYNC_CMD_GET_REFRESH_RATE 10
 
 u32 __nx_fs_num_sessions = 1;
 
@@ -334,49 +328,6 @@ void updateRefreshRate() {
     if (nx_fps) nx_fps -> dontForce60InDocked = dontForce60InDocked;
 }
 
-// Talks to our own display-sync port exactly like an external client does, using the
-// same request layout as the NetherSX2 bridge. Runs once at boot, before any game is
-// started, so the log either proves the endpoint serves requests or names the error.
-// Returns 0 on success, otherwise the failing result code.
-static Result displaySyncSelfTest(u32* outRate)
-{
-    Handle session = INVALID_HANDLE;
-    Result rc = svcConnectToNamedPort(&session, DISPLAY_SYNC_PORT_NAME);
-    if (R_FAILED(rc)) return rc;
-
-    IpcCommand c;
-    ipcInitialize(&c);
-    ipcSendPid(&c);
-
-    struct {
-        u64 magic;
-        u64 cmd_id;
-        u64 reserved[2];
-    } *raw = ipcPrepareHeader(&c, sizeof(*raw));
-
-    raw->magic = SFCI_MAGIC;
-    raw->cmd_id = DISPLAY_SYNC_CMD_GET_REFRESH_RATE;
-
-    rc = ipcDispatch(session);
-    svcCloseHandle(session);
-    if (R_FAILED(rc)) return rc;
-
-    IpcParsedCommand r = {0};
-    ipcParse(&r);
-
-    struct {
-        u64 magic;
-        u64 result;
-        u64 refreshRate;
-        u64 reserved[2];
-    } *resp = r.Raw;
-
-    if (resp->magic != SFCO_MAGIC) return 0xEE01;
-    if (resp->result) return (Result)resp->result;
-    if (outRate) *outRate = (u32)(resp->refreshRate & 0xFF);
-    return 0;
-}
-
 void Initialize() {
     #if !defined(SWITCH) && !defined(OUNCE)
 	    systemtickfrequency = armGetSystemTickFreq();
@@ -468,10 +419,10 @@ void Initialize() {
     // Start our port
     // For some reason, we only have one session maximum (0 reslimit handle related?)	
     svcManageNamedPort(&saltyport, "SaltySD", 1);
-    // Second, single-session port for display-sync clients living inside the hijacked
-    // process. SaltySD accepts one client at a time and Core uses that slot while it
-    // bootstraps, so an app running in the same process can get OutOfResource there.
-    Result displaySyncPortRc = svcManageNamedPort(&saltyportDisplaySync, DISPLAY_SYNC_PORT_NAME, 1);
+    // Second port for display-sync clients living inside the hijacked process. SaltySD
+    // accepts one client at a time and Core uses that slot while it bootstraps, so an
+    // app running in the same process can get OutOfResource there.
+    Result displaySyncPortRc = svcManageNamedPort(&saltyportDisplaySync, DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS);
     if (R_FAILED(displaySyncPortRc))
         SaltyNX_printf(APP_NAME ": failed to create the display-sync port: 0x%x\n", displaySyncPortRc);
     svcManageNamedPort(&injectserv, "InjectServ", 1);
@@ -508,16 +459,9 @@ void Initialize() {
             svcCloseHandle(saltyportDisplaySync);
             saltyportDisplaySync = INVALID_HANDLE;
         }
-        else {
-            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s)\n", DISPLAY_SYNC_PORT_NAME);
-            u32 testRate = 0;
-            Result testRc = displaySyncSelfTest(&testRate);
-            if (R_SUCCEEDED(testRc))
-                SaltyNX_printf(APP_NAME ": display-sync self-test OK (rate %lu, 0 before a game runs)\n",
-                               (unsigned long)testRate);
-            else
-                SaltyNX_printf(APP_NAME ": display-sync self-test failed: 0x%x\n", testRc);
-        }
+        else
+            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s, %d sessions)\n",
+                           DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS);
     }
 }
 
