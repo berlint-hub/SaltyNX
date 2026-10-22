@@ -1285,6 +1285,8 @@ void serviceThreadDisplaySync(void* portHandle)
 {
     const Handle port = (Handle)(uintptr_t)portHandle;
     Result lastAcceptRc = 0;
+    Result lastSessionRc = 0;
+    u32 sessions = 0;
     bool clientSeen = false;
 
     SERVICE_LOG("waiting for a client on the display-sync port");
@@ -1324,7 +1326,12 @@ void serviceThreadDisplaySync(void* portHandle)
             ret = svcReplyAndReceive(&handle_index, &session, 1, replySession, UINT64_MAX);
             if (R_FAILED(ret))
             {
-                SERVICE_LOG("session finished: 0x%x", ret);
+                // A client closing its session ends every poll, so report only the first
+                // few and any change - this must not write to the SD card once per second.
+                if (sessions < 3 || ret != lastSessionRc)
+                    SERVICE_LOG("session finished: 0x%x", ret);
+                lastSessionRc = ret;
+                sessions++;
                 break;
             }
 

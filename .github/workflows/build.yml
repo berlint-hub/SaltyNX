@@ -79,6 +79,20 @@ jobs:
             echo "::error::NethFPS endpoint string is missing from saltynx_proc.elf"
             exit 1
           fi
+          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' version.mk)
+          say "version.mk: $ver"
+          grep -q "\"version\": \"$ver\"" \
+            sdcard_out/atmosphere/contents/0000000000534C56/toolbox.json \
+            || { echo "::error::toolbox.json version does not match version.mk"; exit 1; }
+          say "toolbox.json version matches"
+          for marker in "display-sync endpoint ready" "display-sync self-test"; do
+            if grep -aq "$marker" saltysd_proc/saltynx_proc.elf; then
+              say "marker present: $marker"
+            else
+              echo "::error::marker missing from saltynx_proc.elf: $marker"
+              exit 1
+            fi
+          done
           nsp=sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp
           if grep -aq "NethFPS" "$nsp"; then
             say "NethFPS endpoint string is present in exefs.nsp"
