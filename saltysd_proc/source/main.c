@@ -281,13 +281,31 @@ static void loadForcedRefreshRate() {
     FILE* f = fopen(FORCED_RATE_FILE, "r");
     if (!f)
         return;
-    int value = 0;
-    if (fscanf(f, "%d", &value) == 1 && value >= 1 && value <= 240) {
-        forcedRefreshRate = (uint32_t)value;
-        SaltyNX_printf(APP_NAME ": forcing the panel to %u Hz from " FORCED_RATE_FILE "\n",
-                       forcedRefreshRate);
-    }
+    // Hand-rolled parse on purpose: fscanf() drags the whole scanf engine into the
+    // sysmodule and grows the nsp by ~60 KB, which is not worth one integer.
+    char buf[16] = {0};
+    const size_t got = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
+    if (!got)
+        return;
+    uint32_t value = 0;
+    bool any = false;
+    for (size_t i = 0; i < got; i++) {
+        const char c = buf[i];
+        if (c >= '0' && c <= '9') {
+            if (value > 1000) return;
+            value = value * 10 + (uint32_t)(c - '0');
+            any = true;
+        }
+        else if (any) break;
+        else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        else return;
+    }
+    if (!any || value < 1 || value > 240)
+        return;
+    forcedRefreshRate = value;
+    SaltyNX_printf(APP_NAME ": forcing the panel to %u Hz from " FORCED_RATE_FILE "\n",
+                   forcedRefreshRate);
 }
 
 void cleanAppData() {
