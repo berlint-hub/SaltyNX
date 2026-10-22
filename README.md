@@ -88,6 +88,29 @@ Result codes a client can see when it connects to `NethFPS`:
 | `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
 | `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
+### Logging is opt-in and has two sizes
+
+SaltyNX wrote a line to the SD card for every IPC call the game made - every `fopen`, `fread`, `memcpy`, every directory scan - plus a `stat()` per line to see whether logging was even enabled. During gameplay that is thousands of writes to the same card the game streams its ISO from, which shows up in the frame pacing the log is meant to diagnose, and it makes the log itself unreadable.
+
+Since 2.1.19:
+
+| flag file | what is written |
+| --- | --- |
+| neither | nothing |
+| `sdmc:/SaltySD/flags/log.flag` | decisions, warnings, boot information, NX-FPS/ReverseNX lines, one line every 60 s for the display-sync endpoint |
+| `sdmc:/SaltySD/flags/log.full.flag` | everything, including one line per IPC call |
+
+The ordinary flag now gives a log that fits on a screen for a whole session. The full flag is still there for the "why did this client not connect" case; it just has to be asked for.
+
+```
+sdmc:/SaltySD/flags/log.flag        -> SaltyNX 2.1.19: display-sync endpoint ready ...
+                                       display-sync: refresh rate 60 -> 50 Hz requested (target held 5003 ms, active 50 Hz)
+```
+
+The flags are sampled once a minute instead of once per line, so creating or deleting one takes effect within a minute rather than instantly - the stat() that used to check it per line was itself part of the problem.
+
+`sdmc:/SaltySD/saltynx_core.log` is gated by the same `log.flag` and is unaffected; the core writes a few dozen lines per launch, not thousands.
+
 ### Do not follow a jittery target every second
 
 `updateRefreshRateForApp()` follows `NxFpsSharedBlock::FPSlocked` and calls `SetDisplayRefreshRate()` as soon as the value differs. That is correct for FPSLocker, where the value is a stable user choice, but a client that derives the target from a *measured* frame cadence (NetherSX2 does) wobbles by a few Hz every second - 45/50/55 around a 50 FPS game.

@@ -524,6 +524,10 @@ void Initialize() {
     ABORT_IF_FAILED(fsInitialize(), 2);
     ABORT_IF_FAILED(fsdevMountSdmc(), 3);
     SaltyNX_printf(APP_NAME " " APP_VERSION ": got SD card.\n");
+    // Say which logging mode this boot is in, so a log never leaves it ambiguous why
+    // it is short. Only printed when logging is on at all.
+    if (SaltyNX_LogLevel() != SALTYNX_LOG_SILENT)
+        SaltyNX_printf(APP_NAME ": logging is opt-in: log.flag writes decisions, log.full.flag adds the IPC trace\n");
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);

@@ -10,7 +10,15 @@
 #include <dirent.h>
 #include <errno.h>
 
+// Trace: one line per IPC call, including every fopen/fread/memcpy the game makes.
+// Only written with sdmc:/SaltySD/flags/log.full.flag - the volume is thousands of
+// lines per minute on the same SD card the game is reading.
 #define SERVICE_LOG(fmt, ...) \
+    SaltyNX_printf_trace(APP_NAME ": [%s] " fmt "\n", __func__, ##__VA_ARGS__)
+
+// The handful of lines that explain why display sync did or did not do something.
+// Written with the ordinary sdmc:/SaltySD/flags/log.flag.
+#define SERVICE_LOG_MIN(fmt, ...) \
     SaltyNX_printf(APP_NAME ": [%s] " fmt "\n", __func__, ##__VA_ARGS__)
 
 #define SALTYNX_RESULT(id, val) MAKERESULT(MODULE_SALTYNX, 9000 + ((id) * 10) + (val))
@@ -409,7 +417,7 @@ static Result serviceSetDisplayRefreshRate() {
         ret = 0;
     }
     else ret = SALTYNX_RESULT(handleService_SetDisplayRefreshRate, 1);
-    SERVICE_LOG("refresh rate requested: %d, ret: 0x%x", refreshRate_temp, ret);
+    SERVICE_LOG_MIN("refresh rate requested: %d, ret: 0x%x", refreshRate_temp, ret);
     return ret;
 }
 
@@ -432,7 +440,7 @@ static Result serviceSetDisplaySync() {
     else {
         remove("sdmc:/SaltySD/flags/displaysync.flag");
     }
-    SERVICE_LOG("%d", displaySync);
+    SERVICE_LOG_MIN("%d", displaySync);
 
     return 0;
 }
@@ -552,7 +560,7 @@ static Result serviceSetDisplaySyncDocked() {
     else {
         remove("sdmc:/SaltySD/flags/displaysyncdocked.flag");
     }
-    SERVICE_LOG("%d", displaySyncDocked);
+    SERVICE_LOG_MIN("%d", displaySyncDocked);
 
     return 0;
 }
@@ -572,7 +580,7 @@ static Result serviceSetDisplaySyncRefreshRate60WhenOutOfFocus() {
     bool inDocked = (bool)(resp -> inDocked);
     if (inDocked) {
         displaySyncDockedOutOfFocus60 = (bool)(resp -> value);
-        SERVICE_LOG("Docked %d", displaySyncDockedOutOfFocus60);
+        SERVICE_LOG_MIN("Docked %d", displaySyncDockedOutOfFocus60);
     }
     else {
         displaySyncOutOfFocus60 = (bool)(resp -> value);
@@ -583,7 +591,7 @@ static Result serviceSetDisplaySyncRefreshRate60WhenOutOfFocus() {
         else {
             remove("sdmc:/SaltySD/flags/displaysync_outoffocus.flag");
         }
-        SERVICE_LOG("Handheld %d", displaySyncOutOfFocus60);
+        SERVICE_LOG_MIN("Handheld %d", displaySyncOutOfFocus60);
     }
 
     return 0;
@@ -1341,7 +1349,7 @@ void serviceThreadDisplaySync(void* portHandle)
             if (accepted == 0 && ++idleWaits >= DISPLAY_SYNC_IDLE_WAITS)
             {
                 idleWaits = 0;
-                SERVICE_LOG("no client on port %s yet (endpoint idle on handle 0x%x)",
+                SERVICE_LOG_MIN("no client on port %s yet (endpoint idle on handle 0x%x)",
                             DISPLAY_SYNC_PORT_NAME, port);
             }
             continue;
@@ -1380,7 +1388,7 @@ void serviceThreadDisplaySync(void* portHandle)
 
             if (ret != lastAcceptRc)
             {
-                SERVICE_LOG("accept failed: 0x%x", ret);
+                SERVICE_LOG_MIN("accept failed: 0x%x", ret);
                 lastAcceptRc = ret;
             }
             svcSleepThread(10 * 1000 * 1000);
@@ -1388,12 +1396,12 @@ void serviceThreadDisplaySync(void* portHandle)
         }
 
         if (lastAcceptRc != 0)
-            SERVICE_LOG("accept works again after 0x%x", lastAcceptRc);
+            SERVICE_LOG_MIN("accept works again after 0x%x", lastAcceptRc);
         lastAcceptRc = 0;
 
         accepted++;
         if (accepted <= 3 || (accepted % 60) == 0)
-            SERVICE_LOG("client session #%u accepted", accepted);
+            SERVICE_LOG_MIN("client session #%u accepted", accepted);
 
         Handle replySession = 0;
         while (1)
@@ -1406,7 +1414,7 @@ void serviceThreadDisplaySync(void* portHandle)
                 // the first few sessions and any change - this must not write to the
                 // SD card once per second.
                 if (accepted <= 3 || ret != lastSessionRc)
-                    SERVICE_LOG("session finished: 0x%x", ret);
+                    SERVICE_LOG_MIN("session finished: 0x%x", ret);
                 lastSessionRc = ret;
                 break;
             }
@@ -1417,7 +1425,7 @@ void serviceThreadDisplaySync(void* portHandle)
             if (r.HasPid && (u64)r.Pid != lastClientPid)
             {
                 lastClientPid = (u64)r.Pid;
-                SERVICE_LOG("client PID %lu connected (SaltyNX %s)", lastClientPid, APP_VERSION);
+                SERVICE_LOG_MIN("client PID %lu connected (SaltyNX %s)", lastClientPid, APP_VERSION);
             }
 
             // The client builds its request at TLS+0x20, but the raw payload the
@@ -1463,7 +1471,7 @@ void serviceThreadDisplaySync(void* portHandle)
                 if (!truncatedLogged)
                 {
                     truncatedLogged = 1;
-                    SERVICE_LOG("client raw size %u B hides the command id, treating it as GetSharedMemoryHandle",
+                    SERVICE_LOG_MIN("client raw size %u B hides the command id, treating it as GetSharedMemoryHandle",
                                 raw_bytes);
                 }
             }
@@ -1480,10 +1488,10 @@ void serviceThreadDisplaySync(void* portHandle)
                     handleServiceCmd((int)command);
                     served++;
                     if (served == 1)
-                        SERVICE_LOG("served first command 0x%lx", command);
+                        SERVICE_LOG_MIN("served first command 0x%lx", command);
                     break;
                 default: {
-                    SERVICE_LOG("unsupported command 0x%lx (magic %s, raw %u B)",
+                    SERVICE_LOG_MIN("unsupported command 0x%lx (magic %s, raw %u B)",
                                 command, magic_found ? "found" : "missing", raw_bytes);
                     IpcCommand c;
                     ipcInitialize(&c);
