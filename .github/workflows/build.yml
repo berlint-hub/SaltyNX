@@ -86,7 +86,8 @@ jobs:
             || { echo "::error::toolbox.json version does not match version.mk"; exit 1; }
           say "toolbox.json version matches"
           for marker in "display-sync endpoint ready" "waiting for a client on port" \
-                        "no client on port" "client PID" "session #"; do
+                        "no client on port" "client PID" "session #" \
+                        "hides the command id"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else

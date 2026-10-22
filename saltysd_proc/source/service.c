@@ -1314,6 +1314,7 @@ void serviceThreadDisplaySync(void* portHandle)
     u32 accepted = 0;
     u32 served = 0;
     u32 idleWaits = 0;
+    u32 truncatedLogged = 0;
     u64 lastClientPid = 0;
 
     if (port == INVALID_HANDLE)
@@ -1418,25 +1419,51 @@ void serviceThreadDisplaySync(void* portHandle)
                 SERVICE_LOG("client PID %lu connected", lastClientPid);
             }
 
-            struct
-            {
-                u64 magic;
-                u64 command;
-                u64 reserved[2];
-            } *resp = r.Raw;
+            // The client builds its request at TLS+0x20, but the raw payload the
+            // kernel copies starts at TLS+0x14 (two control words, one descriptor
+            // word and the optional two PID words). A client that declares a raw
+            // size smaller than (0x20-0x14)+16 therefore delivers the magic and
+            // nothing else. NetherSX2 664af43 does exactly that for
+            // GetSharedMemoryHandle (16 B instead of 32 B), so its command id never
+            // arrives and only leftover bytes from the previous reply are visible.
+            // On this endpoint such a request can only mean the shared block, so
+            // serve it instead of pushing the client back to the legacy port.
+            const u32* raw_words = (const u32*)r.Raw;
+            const u32 raw_bytes = (u32)r.RawSize;
+            u64 command;
 
-            switch (resp->command) {
+            if (raw_words[0] != SFCI_MAGIC)
+            {
+                command = UINT64_MAX;
+            }
+            else if (raw_bytes < 6 * sizeof(u32))
+            {
+                command = handleService_GetSharedMemoryHandle;
+                if (!truncatedLogged)
+                {
+                    truncatedLogged = 1;
+                    SERVICE_LOG("client raw size %u B hides the command id, treating it as GetSharedMemoryHandle",
+                                raw_bytes);
+                }
+            }
+            else
+            {
+                command = *(const u64*)(raw_words + 2);
+            }
+
+            switch (command) {
                 // Both replies are produced by handleServiceCmd, so this endpoint stays
                 // byte-for-byte identical with the legacy SaltySD one.
                 case handleService_GetDisplayRefreshRate:
                 case handleService_GetSharedMemoryHandle:
-                    handleServiceCmd((int)resp->command);
+                    handleServiceCmd((int)command);
                     served++;
                     if (served == 1)
-                        SERVICE_LOG("served first command 0x%lx", resp->command);
+                        SERVICE_LOG("served first command 0x%lx", command);
                     break;
                 default: {
-                    SERVICE_LOG("unsupported command 0x%lx", resp->command);
+                    SERVICE_LOG("unsupported command 0x%lx (magic 0x%x, raw %u B)",
+                                command, raw_words[0], raw_bytes);
                     IpcCommand c;
                     ipcInitialize(&c);
                     struct {

@@ -88,6 +88,20 @@ Result codes a client can see when it connects to `NethFPS`:
 | `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
 | `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
+### A client can lose its command id in the raw IPC header
+
+The raw payload of an IPC request does not start at `TLS+0x20`; it starts right after the header (`TLS+0x14` for a request that carries a PID descriptor), and the client declares its length in the second control word. If a client writes its payload at `TLS+0x20` but declares less than `0x0C+16` bytes, the kernel copies only the magic word and the command id never reaches the server.
+
+NetherSX2 664af43 does exactly that for `GetSharedMemoryHandle` (it passes `16` where its own layout needs `32`). The symptom is unmistakable: `GetDisplayRefreshRate` is served normally, while the shared-memory request shows up as an unknown command built from leftover bytes of the previous reply, so the client never maps the NX-FPS block and `active` stays `0`.
+
+Since 2.1.9 the endpoint tolerates it: a request whose raw payload is too short to contain a command id, but which starts with the `SFCI` magic, is treated as `GetSharedMemoryHandle` - the only other command this endpoint serves. The first such request is logged once:
+
+```
+[serviceThreadDisplaySync] client raw size 16 B hides the command id, treating it as GetSharedMemoryHandle
+```
+
+A client that declares the right size never hits this path.
+
 ### The hijacked process may only allow one session
 
 Some titles SaltyNX hijacks are created with a session limit of **one** (`LimitableResource_SessionCountMax`). SaltyNX Core occupies that single slot while it bootstraps, so the app living in the same process cannot open *any* IPC session of its own and gets `0x10801` (`KernelError_OutOfResource`) on every connect - even though the endpoint it targets has free sessions. This is what NetherSX2 hit.
@@ -96,11 +110,13 @@ Since 2.1.8 Core raises the limit of the process it lives in before it connects 
 
 ```
 SaltyNX Core 2.1.8: session limit 1 -> 32
-SaltyNX Core: probe[after-init] pid=142 nethfps=0x0 saltySD=0x10801 sessions=1/32 limitrc=0x0
+SaltyNX Core: probe[after-init] pid=144 nethfps=0x0 saltySD=0xe01 sessions=2/32 limitrc=0x0
 SaltyNX Core: probe[after-deinit] nethfps=0x0
 ```
 
-`svcSetResourceLimitLimitValue` only refuses values below the current usage, so raising is always allowed, and every process starts with its own limit object, so no other process is affected. A control with a normal limit (usually 64) is not touched at all.
+`svcSetResourceLimitLimitValue` only refuses values below the current usage, so raising is always allowed, and every process starts with its own limit object, so no other process is affected. A process with a normal limit is not touched at all.
+
+`saltySD=0xe01` in the probe is expected: the legacy port has a single session slot and Core holds it at that point.
 
 ### Diagnosing a client that never connects
 
