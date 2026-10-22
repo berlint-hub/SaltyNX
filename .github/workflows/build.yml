@@ -1,0 +1,77 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'arena/e0ad6872-saltynx'
+      - 'master'
+
+env:
+  DEVKITPRO: /opt/devkitpro
+  DEVKITARM: /opt/devkitpro/devkitARM
+  PORTLIBS: /opt/devkitpro/portlibs/switch
+
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/devkitpro/devkita64:latest
+      options: --user root
+    steps:
+      - name: Tools the image may lack
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || echo "::warning::apt-get update failed"
+          apt-get install -y --no-install-recommends \
+            make git ca-certificates zip || echo "::warning::some apt packages failed"
+
+      - uses: actions/checkout@v4
+
+      - name: Toolchain inventory
+        run: |
+          echo "DEVKITPRO=$DEVKITPRO"
+          ls "$DEVKITPRO"
+          for f in "$DEVKITPRO/libnx/switch_rules" \
+                   "$DEVKITPRO/libnx/switch.specs" \
+                   "$DEVKITPRO/libnx/switch.ld" \
+                   "$DEVKITPRO/libnx/lib/libnx.a" \
+                   "$DEVKITPRO/devkitA64/base_rules" \
+                   "$DEVKITPRO/libnx/switch.specs"; do
+            if [ -e "$f" ]; then echo "OK       $f"; else echo "::error::missing $f"; fi
+          done
+          for t in elf2nro elf2nso elf2kip nacptool npdmtool build_pfs0 make; do
+            command -v "$t" >/dev/null && echo "OK       tool $t" || echo "::error::missing tool $t"
+          done
+
+      - name: Install devkitARM for the 32-bit payloads
+        run: |
+          if [ ! -f "$DEVKITPRO/devkitARM/base_rules" ]; then
+            PM=$(command -v dkp-pacman || command -v pacman)
+            echo "using $PM"
+            "$PM" -S --needed --noconfirm --disable-download-timeout devkitARM \
+              || "$PM" -Sy --needed --noconfirm --disable-download-timeout devkitARM
+          fi
+          test -f "$DEVKITPRO/devkitARM/base_rules"
+          "$DEVKITPRO/devkitARM/bin/arm-none-eabi-gcc" --version | head -1
+
+      - name: Build
+        run: make -j2
+
+      - name: Package
+        run: |
+          set -eu
+          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' version.mk)
+          test -n "$ver"
+          mkdir -p artifact
+          (cd sdcard_out && zip -qr "../artifact/SaltyNX-${ver}-sdcard.zip" .)
+          cp sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp "artifact/exefs-${ver}.nsp"
+          cp -r sdcard_debug artifact/debug
+          ls -la artifact
+          sha256sum artifact/*.nsp artifact/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SaltyNX-build
+          path: artifact/
+          if-no-files-found: error
