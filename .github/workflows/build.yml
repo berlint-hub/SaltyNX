@@ -94,7 +94,8 @@ jobs:
                         "never goes below" \
                         "logging is opt-in" \
                         "sweep: " \
-                        "fine sync enabled"; do
+                        "fine sync enabled" \
+                        "fine: block="; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else

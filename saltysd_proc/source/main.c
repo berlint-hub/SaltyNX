@@ -491,6 +491,22 @@ void updateRefreshRateForApp() {
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
         const uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
+        if (fineSyncEnabled && !isDocked) {
+            // Fine mode is only as good as NX-FPS's present hook: if that hook never
+            // runs, FPSavg stays at its initial 255 and this whole mode is a no-op that
+            // looks identical to "the panel just did not move". Say so out loud.
+            static u64 lastFineLog = 0;
+            const u64 nowFine = svcGetSystemTick();
+            if (nowFine - lastFineLog >= 10000ULL * SV_TICKS_PER_MS) {
+                lastFineLog = nowFine;
+                const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
+                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u target=%u panel=%u\n",
+                               nx_fps ? "found" : "missing",
+                               nx_fps ? (u32)nx_fps->FPS : 0,
+                               avg_x100 / 100, avg_x100 % 100,
+                               fineMeasuredTarget(), temp_refreshRate);
+            }
+        }
         uint32_t check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
@@ -565,11 +581,18 @@ void updateRefreshRateForApp() {
                 pendingRefreshRate = 0;
             }
             else if (check_refresh_rate != pendingRefreshRate) {
-                u64 requiredMs = REFRESH_RATE_LARGE_MS;
-                if (delta <= REFRESH_RATE_SMALL_DELTA)
-                    requiredMs = (check_refresh_rate > temp_refreshRate)
-                                 ? REFRESH_RATE_SMALL_UP_MS
-                                 : REFRESH_RATE_SMALL_DOWN_MS;
+                // Only a large *drop* is worth acting on quickly: that is a game
+                // switching from 60 to a PAL cap, or a loading screen ending. A large
+                // rise gets the slow treatment, because a client can publish 60 for one
+                // sample right after a gameplay stretch and the panel would visibly jump
+                // to 60 and straight back.
+                u64 requiredMs;
+                if (check_refresh_rate > temp_refreshRate)
+                    requiredMs = REFRESH_RATE_SMALL_UP_MS;
+                else if (delta <= REFRESH_RATE_SMALL_DELTA)
+                    requiredMs = REFRESH_RATE_SMALL_DOWN_MS;
+                else
+                    requiredMs = REFRESH_RATE_LARGE_MS;
                 pendingRefreshRate = check_refresh_rate;
                 pendingRefreshSince = now;
                 pendingRefreshRequired = requiredMs * SV_TICKS_PER_MS;
@@ -593,8 +616,11 @@ void updateRefreshRateForApp() {
                 // there is no room left to move down, and the panel holding the app
                 // down looks exactly like a slow game. Arm one test, and keep the
                 // excursion small - a 50 -> 60 jump is far more visible than 50 -> 55.
+                // Only a *small* drop can be the lock-in case: the panel sits just above
+                // the floor, the client measures the panel instead of the game, and the
+                // two converge. 60 -> 50 is the client asking for 50, not a lock-in.
                 probeArmed = !fineRate &&
-                             (check_refresh_rate < temp_refreshRate) &&
+                             (temp_refreshRate - check_refresh_rate <= REFRESH_RATE_SMALL_DELTA) &&
                              (check_refresh_rate == DISPLAY_SYNC_MIN_RATE) &&
                              (temp_refreshRate <= HandheldModeRefreshRateAllowed.max) &&
                              (temp_refreshRate != probeFailedRate) &&

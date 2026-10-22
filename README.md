@@ -121,9 +121,11 @@ Since 2.1.11 no correction is applied immediately. Since 2.1.12 the wait depends
 
 | correction | wait before the panel follows |
 | --- | --- |
-| large (docked/undocked, new FPSLocker cap far from the current rate) | 1.5 s |
-| small rise, e.g. 45 -> 50 | 5 s |
+| large drop, e.g. 60 -> 50 when a PAL game starts | 1.5 s |
+| any rise, e.g. 45 -> 50 or 50 -> 60 | 5 s |
 | small drop, e.g. 50 -> 45 | 20 s |
+
+Only a large drop is allowed to act quickly. A large *rise* gets the slow treatment because a client can publish 60 for a single sample right after a gameplay stretch, and the panel would visibly jump to 60 and straight back.
 
 A small drop is almost always one slow frame being measured, never a new intent, and it is the expensive direction - the panel drops a mode and the picture gets slower. A small rise restores the rate the app actually wants, so it is allowed to happen quickly. Applied switches report both the requested and the effective rate, because the panel clamps (25 Hz is served as 50 Hz):
 
@@ -159,6 +161,17 @@ Everything else still applies, with two exceptions:
 | lock-in test | armed on a drop to the floor | disabled (the loop is the point) |
 
 Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is zero before the first presented frame, so "not measuring yet" must not move the panel.
+
+Fine mode is only as good as the measurement behind it, and that is the open question. `FPSavg` is written from NX-FPS's present hook, which is installed by rewriting the game's import table - a game that resolves `vkQueuePresentKHR` at runtime, the way a Vulkan wrapper does, never calls the hooked copy. When that happens the shared field keeps its initial 255 and fine mode silently does nothing, which looks exactly like "the panel just did not want to move".
+
+Since 2.1.22 the answer is printed every ten seconds while the flag is present:
+
+```
+SaltyNX: fine: block=found FPS=50 FPSavg=49.87 target=50 panel=50
+SaltyNX: fine: block=found FPS=0 FPSavg=255.00 target=0 panel=50
+```
+
+`FPSavg=255.00` means the hook never ran and fine mode has no measurement to follow. `target=0` is the consequence - the normal path takes over, floor and all.
 
 This is the experiment, not a default. It can drop the panel below 50, which is exactly what the normal mode forbids, and it follows a measurement that includes the panel's own influence - the loop that made 2.1.16 necessary still exists here, it is just being asked to do something useful instead of something harmful.
 
@@ -211,7 +224,7 @@ A drop is the only direction that can become permanent. The panel slows down, th
 
 A rise cannot get stuck that way, because the app can always correct it down. So the way out is to walk the panel back up once and watch what the app does:
 
-- an applied drop *to the 50 Hz floor* arms one test (a drop between 60/55/50 above the floor is a real one, not a lock-in);
+- only a *small* drop to the 50 Hz floor arms one test - 50 -> 45 is the lock-in shape, while 60 -> 50 is simply the client asking for 50;
 - after 10 s with nothing changing, the panel is moved back to the rate it just left, for up to 12 s;
 - if the published target follows upward, the low reading was the panel's ceiling and the higher rate is kept;
 - if it does not, the game really cannot fill the panel, the old rate is restored and that rate is never tested again for this app.
