@@ -59,54 +59,40 @@ Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berli
 `sdmc:/SaltySD/saltynx.log` (written when `SaltySD/flags/log.flag` exists) shows the endpoint coming up and every client it serves:
 
 ```
-SaltyNX 2.1.5: got SD card.
-SaltyNX: display-sync endpoint ready (NethFPS, 4 sessions)
-SaltyNX: [serviceThreadDisplaySync] waiting for a client on port NethFPS
+SaltyNX 2.1.6: got SD card.
+SaltyNX: display-sync endpoint ready (NethFPS, 4 sessions, handle 0x...)
+SaltyNX: [serviceThreadDisplaySync] waiting for a client on port NethFPS (handle 0x...)
+SaltyNX: [serviceThreadDisplaySync] client session #1 accepted
 SaltyNX: [serviceThreadDisplaySync] client PID 141 connected
+SaltyNX: [serviceThreadDisplaySync] served first command 0xa
 SaltyNX: [serviceThreadDisplaySync] session finished: 0xf601
 ```
 
-`0xf601` is `KernelError_ConnectionClosed`: the client closed its session after the reply, which happens once per poll. Only the first few are logged, then only changes.
+`0xf601` is `KernelError_ConnectionClosed`: the client closed its session after the reply, which happens once per poll. Only the first few sessions are logged, then every 60th one, so a client polling once per second does not hammer the SD card.
 
-Failures are logged once per distinct code, so a silent log really means "nothing tried to connect". If `accept` reports `0xf201` (`KernelError_NotFound`) for a full second, the endpoint drops the port handle and registers the name again, logging `port NethFPS re-registered`.
+If no client connects at all, the endpoint says so once per 30 seconds (`no client on port NethFPS yet (endpoint idle on handle 0x...)`). That line proves the worker thread is alive and the port handle is valid, so an idle endpoint can be told apart from a broken one.
 
-Result codes a client sees when it connects to `NethFPS`:
+The worker waits on the port handle instead of polling `svcAcceptSession`, because of how the kernel actually behaves:
+
+- `svcAcceptSession` returns `KernelError_NotFound` (`0xF201`) whenever no client is queued. That is the normal idle answer, not a failure, and the endpoint never treats it as one. Builds 2.1.4 and 2.1.5 added "recovery" for it, which is what broke the endpoint on device.
+- A server port handle is signalled as soon as a client session is queued, so waiting on it is enough.
+- The name `NethFPS` in the kernel name list holds its own reference to the client port. Closing the server handle does **not** remove the name: a following `svcManageNamedPort` fails with `KernelError_InvalidState` (`0xFA01`) and clients keep connecting to a port nobody accepts on. The port is therefore created once at boot and never closed while SaltyNX runs. To really remove the name (only done when the worker thread cannot start), `svcManageNamedPort` has to be called with `maxSessions == 0`.
+
+Result codes a client can see when it connects to `NethFPS`:
 
 | Code | Name | Meaning |
 | --- | --- | --- |
 | `0` | - | connected |
 | `0xF201` | `KernelError_NotFound` | no such port: an older sysmodule is running |
-| `0x10801` | `KernelError_OutOfResource` | the port exists but all `DISPLAY_SYNC_SESSIONS` are taken |
+| `0xE01` | `KernelError_OutOfSessions` | the port exists but all `DISPLAY_SYNC_SESSIONS` are already accepted and not closed |
+| `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
+| `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
-Note that `OutOfResource` on the *legacy* port is normal while a game runs, because Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
+The `0x10801` case is the important one for diagnostics: the kernel looks the port name up *before* it reserves a session, so this code proves the endpoint exists and is reachable. Nothing on the SaltyNX side can fix it - the client process has to free session slots (or retry) itself.
 
-Do not connect to this port from inside the sysmodule itself. A same-process loopback client (a boot-time self-test, for instance) leaves a session slot that never frees, after which every external client gets `OutOfResource` while `accept` only reports `NotFound`. Build 2.1.4 shipped such a self-test and broke the endpoint this way.
+Note that a session error on the *legacy* `SaltySD` port is normal while a game runs, because SaltyNX Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
 
-Reference client: `saltysd_display.c` in [NetherSX2_nx](https://github.com/berlint-hub/NetherSX2_nx).
-
-### Verifying the endpoint
-
-Right after boot, `sdmc:/SaltySD/saltynx.log` (written when `SaltySD/flags/log.flag` exists) has to contain the version line and these three lines from the sysmodule itself:
-
-```
-SaltyNX 2.1.4: got SD card.
-SaltyNX: display-sync endpoint ready (NethFPS)
-SaltyNX: display-sync self-test OK (rate 0, 0 before a game runs)
-```
-
-The self-test connects to the port at boot and performs one `GetDisplayRefreshRate` request through it, so a working log means the endpoint really serves requests. If the self-test fails, it prints the kernel result code instead.
-
-When a client then connects, `SaltyNX: [serviceThreadDisplaySync] display-sync client connected` shows up. Failures are logged once per distinct code, so a silent log really means "nothing tried to connect".
-
-Result codes a client sees when it connects to `NethFPS`:
-
-| Code | Name | Meaning |
-| --- | --- | --- |
-| `0` | - | connected |
-| `0xF201` | `KernelError_NotFound` | no such port: an older sysmodule is running, or the port could not be created (see the log) |
-| `0x10801` | `KernelError_OutOfResource` | the port exists but another client holds its only session |
-
-Note that `OutOfResource` on the *legacy* port is normal while a game runs, because Core owns that session. A client should always report the two connect attempts separately, otherwise a failing `NethFPS` attempt is indistinguishable from the expected busy legacy port.
+Do not connect to this port from inside the sysmodule itself. A same-process loopback client (a boot-time self-test, for instance) leaves a session slot that never frees, after which external clients fail while the server side looks idle. Build 2.1.4 shipped such a self-test and broke the endpoint this way.
 
 # How to install release:
 

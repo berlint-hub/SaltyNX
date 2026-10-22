@@ -455,13 +455,20 @@ void Initialize() {
         if (R_FAILED(threadRc)) {
             SaltyNX_printf(APP_NAME ": display-sync thread failed to start: 0x%x\n", threadRc);
             // Nobody would accept on this port, so a client would connect and then wait
-            // forever instead of falling back to the legacy port. Remove it instead.
+            // forever instead of falling back to the legacy port. Closing our handle is
+            // not enough - the name keeps its own reference to the client port - so the
+            // name itself has to be deleted with maxSessions == 0.
+            Handle removed = INVALID_HANDLE;
+            Result removeRc = svcManageNamedPort(&removed, DISPLAY_SYNC_PORT_NAME, 0);
+            if (R_FAILED(removeRc))
+                SaltyNX_printf(APP_NAME ": failed to unregister port %s: 0x%x\n",
+                               DISPLAY_SYNC_PORT_NAME, removeRc);
             svcCloseHandle(saltyportDisplaySync);
             saltyportDisplaySync = INVALID_HANDLE;
         }
         else
-            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s, %d sessions)\n",
-                           DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS);
+            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s, %d sessions, handle 0x%x)\n",
+                           DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS, saltyportDisplaySync);
     }
 }
 
