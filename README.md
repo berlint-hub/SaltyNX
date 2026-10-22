@@ -102,6 +102,15 @@ Since 2.1.9 the endpoint tolerates it: a request whose raw payload is too short 
 
 A client that declares the right size never hits this path.
 
+Both display-sync log lines carry the sysmodule version, so a log can never be attributed to the wrong build again:
+
+```
+SaltyNX 2.1.10: display-sync endpoint ready (NethFPS, 4 sessions, handle 0x...)
+[serviceThreadDisplaySync] client PID 147 connected (SaltyNX 2.1.10)
+```
+
+The version in `saltynx.log` must match the `NethFPS` endpoint you are testing - `saltynx_proc.nsp` (the sysmodule) and `saltynx_core.elf` are two separate files and are easy to update unevenly.
+
 ### The hijacked process may only allow one session
 
 Some titles SaltyNX hijacks are created with a session limit of **one** (`LimitableResource_SessionCountMax`). SaltyNX Core occupies that single slot while it bootstraps, so the app living in the same process cannot open *any* IPC session of its own and gets `0x10801` (`KernelError_OutOfResource`) on every connect - even though the endpoint it targets has free sessions. This is what NetherSX2 hit.

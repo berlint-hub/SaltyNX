@@ -1323,7 +1323,8 @@ void serviceThreadDisplaySync(void* portHandle)
         return;
     }
 
-    SERVICE_LOG("waiting for a client on port %s (handle 0x%x)", DISPLAY_SYNC_PORT_NAME, port);
+    SERVICE_LOG("waiting for a client on port %s (handle 0x%x, SaltyNX %s)",
+                DISPLAY_SYNC_PORT_NAME, port, APP_VERSION);
 
     while (1)
     {
@@ -1416,7 +1417,7 @@ void serviceThreadDisplaySync(void* portHandle)
             if (r.HasPid && (u64)r.Pid != lastClientPid)
             {
                 lastClientPid = (u64)r.Pid;
-                SERVICE_LOG("client PID %lu connected", lastClientPid);
+                SERVICE_LOG("client PID %lu connected (SaltyNX %s)", lastClientPid, APP_VERSION);
             }
 
             // The client builds its request at TLS+0x20, but the raw payload the

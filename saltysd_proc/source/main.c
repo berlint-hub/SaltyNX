@@ -467,7 +467,7 @@ void Initialize() {
             saltyportDisplaySync = INVALID_HANDLE;
         }
         else
-            SaltyNX_printf(APP_NAME ": display-sync endpoint ready (%s, %d sessions, handle 0x%x)\n",
+            SaltyNX_printf(APP_NAME " " APP_VERSION ": display-sync endpoint ready (%s, %d sessions, handle 0x%x)\n",
                            DISPLAY_SYNC_PORT_NAME, DISPLAY_SYNC_SESSIONS, saltyportDisplaySync);
     }
 }
