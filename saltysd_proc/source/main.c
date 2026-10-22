@@ -239,10 +239,38 @@ void checkIfDmntChtNeedsToBeActive() {
     }
 }
 
+// A client that derives its target from a *measured* frame cadence does not publish
+// a clean cap. NetherSX2 publishes the rate it just measured, quantised to 5 Hz, so
+// around a 50 FPS PAL game the target walks 45/50/55 for seconds at a time.
+//
+// Every SetDisplayRefreshRate is a real panel mode switch (PLLD + nvdisp), so
+// following that walk is expensive: the picture hitches, the hitch changes the
+// measured cadence, and the next target is wrong again. That feedback loop is what
+// made display sync feel like it kept slowing down.
+//
+// Corrections are therefore asymmetric:
+//   * a large change (new FPSLocker cap, docked switch) applies after 1.5 s;
+//   * a small rise (45 -> 50) applies after 5 s, because it restores the panel to
+//     the rate the app actually wants;
+//   * a small drop (50 -> 45) applies only after 20 s, because a sudden few-Hz drop
+//     is almost always one slow frame being measured, and dropping the panel costs a
+//     mode switch plus a slower picture.
+#define REFRESH_RATE_SMALL_DELTA   5u
+#define REFRESH_RATE_SMALL_UP_MS   5000ULL
+#define REFRESH_RATE_SMALL_DOWN_MS 20000ULL
+#define REFRESH_RATE_LARGE_MS      1500ULL
+#define SV_TICKS_PER_MS        19200ULL
+
+static uint32_t pendingRefreshRate = 0;
+static u64 pendingRefreshSince = 0;
+static u64 pendingRefreshRequired = 0;
+
 void cleanAppData() {
     lastAppPID = -1;
     nx_fps = 0;
     cheatCheck = false;
+    pendingRefreshRate = 0;
+    pendingRefreshRequired = 0;
     uintptr_t shmem = (uintptr_t)shmemGetAddr(&_sharedMemory);
     if (shmem) {
         memset((void*)(shmem+4), 0, shmem_size-4);
@@ -269,24 +297,6 @@ void cleanAppData() {
     }
 }
 
-// A client that derives its target from a *measured* frame cadence wobbles by a
-// few Hz every second (45/50/55 around a 50 FPS game). Following every change is
-// what makes display sync feel broken: every SetDisplayRefreshRate is a real panel
-// mode switch, so the picture hitches - and the hitch changes the measured cadence
-// again, which makes the next switch even more likely.
-//
-// A small correction (<= 5 Hz around the current rate) therefore has to survive for
-// several seconds before the panel follows it, while a real change (a new FPSLocker
-// target, docked/handheld switch) still applies quickly.
-#define REFRESH_RATE_SMALL_DELTA  5u
-#define REFRESH_RATE_SMALL_MS  5000ULL
-#define REFRESH_RATE_LARGE_MS  1500ULL
-#define SV_TICKS_PER_MS       19200ULL
-
-static uint32_t pendingRefreshRate = 0;
-static u64 pendingRefreshSince = 0;
-static u64 pendingRefreshRequired = 0;
-
 void updateRefreshRateForApp() {
     if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
@@ -310,17 +320,27 @@ void updateRefreshRateForApp() {
                 const uint32_t delta = (check_refresh_rate > temp_refreshRate)
                                      ? (check_refresh_rate - temp_refreshRate)
                                      : (temp_refreshRate - check_refresh_rate);
+                u64 requiredMs = REFRESH_RATE_LARGE_MS;
+                if (delta <= REFRESH_RATE_SMALL_DELTA)
+                    requiredMs = (check_refresh_rate > temp_refreshRate)
+                                 ? REFRESH_RATE_SMALL_UP_MS
+                                 : REFRESH_RATE_SMALL_DOWN_MS;
                 pendingRefreshRate = check_refresh_rate;
                 pendingRefreshSince = now;
-                pendingRefreshRequired = ((delta <= REFRESH_RATE_SMALL_DELTA)
-                                          ? REFRESH_RATE_SMALL_MS
-                                          : REFRESH_RATE_LARGE_MS) * SV_TICKS_PER_MS;
+                pendingRefreshRequired = requiredMs * SV_TICKS_PER_MS;
             }
             else if (now - pendingRefreshSince >= pendingRefreshRequired) {
-                SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz (target held %u ms)\n",
-                               temp_refreshRate, check_refresh_rate,
-                               (u32)((now - pendingRefreshSince) / SV_TICKS_PER_MS));
+                const u32 heldMs = (u32)((now - pendingRefreshSince) / SV_TICKS_PER_MS);
+                uint32_t achievedRate = 0;
                 SetDisplayRefreshRate(check_refresh_rate);
+                // The panel quantises and clamps (25 Hz is served as 50 Hz on OLED),
+                // so report what the hardware ended up at, not what we asked for.
+                if (GetDisplayRefreshRate(&achievedRate, true))
+                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms, active %u Hz)\n",
+                                   temp_refreshRate, check_refresh_rate, heldMs, achievedRate);
+                else
+                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms)\n",
+                                   temp_refreshRate, check_refresh_rate, heldMs);
                 pendingRefreshRate = 0;
             }
         }

@@ -1421,24 +1421,44 @@ void serviceThreadDisplaySync(void* portHandle)
             }
 
             // The client builds its request at TLS+0x20, but the raw payload the
-            // kernel copies starts at TLS+0x14 (two control words, one descriptor
-            // word and the optional two PID words). A client that declares a raw
-            // size smaller than (0x20-0x14)+16 therefore delivers the magic and
-            // nothing else. NetherSX2 664af43 does exactly that for
-            // GetSharedMemoryHandle (16 B instead of 32 B), so its command id never
-            // arrives and only leftover bytes from the previous reply are visible.
-            // On this endpoint such a request can only mean the shared block, so
-            // serve it instead of pushing the client back to the legacy port.
+            // kernel copies starts at TLS+0x14, so where the {magic, cmd} pair lands
+            // depends on how many words the client declared. Word 0 is therefore not
+            // a reliable place to look: a full 32 B request carries a stale
+            // SFCO_MAGIC there and the real pair at word 3, which is why those calls
+            // used to arrive as "unsupported command 0xffffffffffffffff" while the
+            // 16 B one worked by accident. Scan the whole window for the request
+            // magic instead.
+            //
+            // A 16 B request (NetherSX2 asks for the shared block that way) can end
+            // before the command id, and that size only ever means the shared block
+            // on this endpoint, so serve it rather than pushing the client back to
+            // the legacy port.
             const u32* raw_words = (const u32*)r.Raw;
             const u32 raw_bytes = (u32)r.RawSize;
-            u64 command;
+            const u32 raw_word_count = raw_bytes / sizeof(u32);
+            u64 command = UINT64_MAX;
+            u32 magic_index = 0;
+            bool magic_found = false;
 
-            if (raw_words[0] != SFCI_MAGIC)
+            for (u32 i = 0; i < raw_word_count; i++)
+            {
+                if (raw_words[i] == SFCI_MAGIC)
+                {
+                    magic_found = true;
+                    magic_index = i;
+                    break;
+                }
+            }
+
+            if (!magic_found)
             {
                 command = UINT64_MAX;
             }
-            else if (raw_bytes < 6 * sizeof(u32))
+            else if (raw_word_count < magic_index + 4)
             {
+                // Only the magic made it in, the command id did not. One request is
+                // that short (NetherSX2 asks for the shared block with 16 B), and
+                // this endpoint has no other command that small.
                 command = handleService_GetSharedMemoryHandle;
                 if (!truncatedLogged)
                 {
@@ -1449,7 +1469,7 @@ void serviceThreadDisplaySync(void* portHandle)
             }
             else
             {
-                command = *(const u64*)(raw_words + 2);
+                command = *(const u64*)(raw_words + magic_index + 2);
             }
 
             switch (command) {
@@ -1463,8 +1483,8 @@ void serviceThreadDisplaySync(void* portHandle)
                         SERVICE_LOG("served first command 0x%lx", command);
                     break;
                 default: {
-                    SERVICE_LOG("unsupported command 0x%lx (magic 0x%x, raw %u B)",
-                                command, raw_words[0], raw_bytes);
+                    SERVICE_LOG("unsupported command 0x%lx (magic %s, raw %u B)",
+                                command, magic_found ? "found" : "missing", raw_bytes);
                     IpcCommand c;
                     ipcInitialize(&c);
                     struct {

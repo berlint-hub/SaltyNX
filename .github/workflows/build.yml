@@ -87,7 +87,8 @@ jobs:
           say "toolbox.json version matches"
           for marker in "display-sync endpoint ready" "waiting for a client on port" \
                         "no client on port" "client PID" "session #" \
-                        "hides the command id"; do
+                        "hides the command id" \
+                        "target held"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else

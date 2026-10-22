@@ -94,13 +94,21 @@ Result codes a client can see when it connects to `NethFPS`:
 
 Each of those calls is a real panel mode switch. The picture hitches, the hitch perturbs the measured cadence, and the mismatch feeds itself, so the game feels like it keeps slowing down.
 
-Since 2.1.11 a small correction (<= 5 Hz) has to hold for 5 s before the panel follows it, while a real change (new FPSLocker target, docked switch) still applies after 1.5 s. Applied switches are logged:
+Since 2.1.11 no correction is applied immediately. Since 2.1.12 the wait depends on the direction, because a flat hysteresis only slows a feedback loop down instead of breaking it - a 5 s window on both directions turned five switches in nine seconds into two switches in eleven seconds, still 45 before 50:
+
+| correction | wait before the panel follows |
+| --- | --- |
+| large (docked/undocked, new FPSLocker cap far from the current rate) | 1.5 s |
+| small rise, e.g. 45 -> 50 | 5 s |
+| small drop, e.g. 50 -> 45 | 20 s |
+
+A small drop is almost always one slow frame being measured, never a new intent, and it is the expensive direction - the panel drops a mode and the picture gets slower. A small rise restores the rate the app actually wants, so it is allowed to happen quickly. Applied switches report both the requested and the effective rate, because the panel clamps (25 Hz is served as 50 Hz):
 
 ```
-SaltyNX: display-sync: refresh rate 60 -> 50 Hz (target held 5104 ms)
+SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms, active 45 Hz)
 ```
 
-Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated.
+Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
 ### A client can lose its command id in the raw IPC header
 
@@ -108,13 +116,21 @@ The raw payload of an IPC request does not start at `TLS+0x20`; it starts right 
 
 NetherSX2 664af43 does exactly that for `GetSharedMemoryHandle` (it passes `16` where its own layout needs `32`). The symptom is unmistakable: `GetDisplayRefreshRate` is served normally, while the shared-memory request shows up as an unknown command built from leftover bytes of the previous reply, so the client never maps the NX-FPS block and `active` stays `0`.
 
-Since 2.1.9 the endpoint tolerates it: a request whose raw payload is too short to contain a command id, but which starts with the `SFCI` magic, is treated as `GetSharedMemoryHandle` - the only other command this endpoint serves. The first such request is logged once:
+Since 2.1.9 the endpoint tolerates it: a request whose raw payload is too short to contain a command id, but which contains the `SFCI` magic, is treated as `GetSharedMemoryHandle` - the only other command this endpoint serves. The first such request is logged once:
 
 ```
 [serviceThreadDisplaySync] client raw size 16 B hides the command id, treating it as GetSharedMemoryHandle
 ```
 
-A client that declares the right size never hits this path.
+The 2.1.9 version of that check still looked for the magic in word 0, which is where it sits only for the short request. The 32 B `GetDisplayRefreshRate` request carries a stale `SFCO` magic from the previous reply in word 0 and the real pair in word 3, so every rate query was answered with an error and logged as `unsupported command 0xffffffffffffffff` - it looked like a client that never asks for the rate, while the diagnostics showed the rate changing all along (the client reads it from the shared block instead).
+
+Since 2.1.12 the whole copied window is scanned for the magic:
+
+```
+[serviceThreadDisplaySync] unsupported command 0x... (magic missing, raw 32 B)
+```
+
+A client that declares the right size never hits the short path.
 
 Both display-sync log lines carry the sysmodule version, so a log can never be attributed to the wrong build again:
 
