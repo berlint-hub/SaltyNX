@@ -93,7 +93,8 @@ jobs:
                         "which the app held before" \
                         "never goes below" \
                         "logging is opt-in" \
-                        "sweep: "; do
+                        "sweep: " \
+                        "fine sync enabled"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else

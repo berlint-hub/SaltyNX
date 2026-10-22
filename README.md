@@ -133,6 +133,35 @@ SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms,
 
 Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
+### Fine mode: follow the measured rate to the hertz
+
+The 2.1.20 sweep proved the panel takes every integer rate from 45 to 52 exactly, one hertz apart. That makes a real 1 Hz sync possible - but not through the client, which quantises its target to 5 Hz. The sysmodule already has a measured source of its own: NX-FPS writes an EMA of the frame interval into the shared block as `FPSavg` on every presented frame, for NVN, EGL and Vulkan alike.
+
+Fine mode follows that instead of `FPSlocked`:
+
+```
+sdmc:/SaltySD/flags/sync_fine.flag        (create, then reboot)
+```
+
+```
+SaltyNX: fine sync enabled from sdmc:/SaltySD/flags/sync_fine.flag, following the measured rate to the hertz
+SaltyNX: display-sync: refresh rate 50 -> 49 Hz requested (target held 5013 ms, active 49 Hz, measured)
+```
+
+Everything else still applies, with two exceptions:
+
+| | normal mode | fine mode |
+| --- | --- | --- |
+| target source | client's `FPSlocked` (5 Hz table) | NX-FPS `FPSavg` (measured, 1 Hz) |
+| floor | 50 Hz | the panel's own minimum (45 Hz on OLED) |
+| deadband | 1 Hz | 0 - a one hertz change is the point |
+| rise / drop / large | 5 s / 20 s / 1.5 s | unchanged |
+| lock-in test | armed on a drop to the floor | disabled (the loop is the point) |
+
+Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is zero before the first presented frame, so "not measuring yet" must not move the panel.
+
+This is the experiment, not a default. It can drop the panel below 50, which is exactly what the normal mode forbids, and it follows a measurement that includes the panel's own influence - the loop that made 2.1.16 necessary still exists here, it is just being asked to do something useful instead of something harmful.
+
 ### Testing whether the panel takes a rate the clients cannot ask for
 
 Neither FPSLocker nor NetherSX2 can publish anything outside their own 5 Hz table, so "does this panel lock at 49 Hz?" cannot be answered from the client side. The sysmodule can answer it itself: put a list of rates in

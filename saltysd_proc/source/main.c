@@ -331,6 +331,48 @@ static uint32_t testSweepIndex = 0;
 static u64 testSweepNextStep = 0;
 static bool testSweepDone = false;
 
+// ---------------------------------------------------------------------------
+// Fine mode: let the panel follow the rate the game is actually presenting at, to the
+// hertz, instead of snapping to the client's 5 Hz table.
+//
+// The measured source is NX-FPS itself: its present hook writes an EMA of the frame
+// interval into the shared block as FPSavg on every presented frame, for NVN, EGL and
+// Vulkan. That is a real measurement from the game, independent of whatever the client
+// publishes into FPSlocked, so this works with any game and not just NetherSX2.
+//
+// Opt-in, because it is the experiment: it allows rates the normal mode refuses.
+//
+//     sdmc:/SaltySD/flags/sync_fine.flag        (create, then reboot)
+//
+// Everything else still applies - the 5 s rise, the 20 s drop, the large-change 1.5 s -
+// except the 1 Hz deadband, which has to go or nothing would ever move by one.
+#define FINE_SYNC_FILE "sdmc:/SaltySD/flags/sync_fine.flag"
+
+static bool fineSyncEnabled = false;
+
+static void loadFineSyncFlag() {
+    fineSyncEnabled = file_or_directory_exists(FINE_SYNC_FILE);
+    if (fineSyncEnabled)
+        SaltyNX_printf(APP_NAME ": fine sync enabled from " FINE_SYNC_FILE ", following the measured rate to the hertz\n");
+}
+
+// Returns 0 when there is nothing trustworthy to follow.
+static uint32_t fineMeasuredTarget() {
+    if (!nx_fps)
+        return 0;
+    const float avg = nx_fps->FPSavg;
+    // FPSavg starts at 255 in NX-FPS and stays 0 before the first PostFrame, so
+    // anything outside a plausible range means "not measuring yet".
+    if (!(avg >= 30.0f && avg <= 240.0f))
+        return 0;
+    uint32_t target = (uint32_t)(avg + 0.5f);
+    if (target < HandheldModeRefreshRateAllowed.min)
+        target = HandheldModeRefreshRateAllowed.min;
+    else if (target > HandheldModeRefreshRateAllowed.max)
+        target = HandheldModeRefreshRateAllowed.max;
+    return target;
+}
+
 static void loadTestSweep() {
     FILE* f = fopen(TEST_SWEEP_FILE, "r");
     if (!f)
@@ -448,10 +490,14 @@ void updateRefreshRateForApp() {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
-        uint32_t check_refresh_rate = requestedRate ? requestedRate : refreshRate;
+        const uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
+        uint32_t check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
-        if (!isDocked && requestedRate && check_refresh_rate < DISPLAY_SYNC_MIN_RATE) {
+        // The 50 Hz floor exists to stop the loop from dragging itself down through the
+        // client's quantised target. Fine mode follows a real measurement instead, so it
+        // is allowed the panel's own minimum.
+        if (!fineRate && !isDocked && requestedRate && check_refresh_rate < DISPLAY_SYNC_MIN_RATE) {
             if (!minRateClampLogged) {
                 minRateClampLogged = true;
                 SaltyNX_printf(APP_NAME ": display-sync: ignoring the %u Hz target, this sync never goes below %u Hz\n",
@@ -473,13 +519,16 @@ void updateRefreshRateForApp() {
 
         if (probeFromRate) {
             // Testing upward: hold the panel still and watch what the app publishes.
-            if (check_refresh_rate > probeFromRate) {
+            // The target only counts as followed if it comes back to the rate being
+            // tested - "it moved up somehow" is not the same thing, and 2.1.19 read a
+            // target of 55 at 60 Hz as proof that 50 had been the panel's ceiling.
+            if (check_refresh_rate + 1 >= probeTarget) {
                 uint32_t achieved = 0;
                 if (GetDisplayRefreshRate(&achieved, true))
-                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was locked in, target followed to %u Hz (active %u Hz)\n",
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was the ceiling, target followed to %u Hz (active %u Hz)\n",
                                    probeFromRate, check_refresh_rate, achieved);
                 else
-                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was locked in, target followed to %u Hz\n",
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was the ceiling, target followed to %u Hz\n",
                                    probeFromRate, check_refresh_rate);
                 probeFromRate = 0;
                 probeArmed = false;
@@ -510,7 +559,7 @@ void updateRefreshRateForApp() {
                                  ? (check_refresh_rate - temp_refreshRate)
                                  : (temp_refreshRate - check_refresh_rate);
             sameRateSince = 0;
-            if (delta <= REFRESH_RATE_DEADBAND_HZ) {
+            if (delta <= (fineRate ? 0u : REFRESH_RATE_DEADBAND_HZ)) {
                 // One hertz is below what the eye resolves and costs a full mode
                 // switch, so it is always measurement noise, never an intent.
                 pendingRefreshRate = 0;
@@ -532,23 +581,32 @@ void updateRefreshRateForApp() {
                 // The panel quantises and clamps (25 Hz is served as 50 Hz on OLED),
                 // so report what the hardware ended up at, not what we asked for.
                 if (GetDisplayRefreshRate(&achievedRate, true))
-                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms, active %u Hz)\n",
-                                   temp_refreshRate, check_refresh_rate, heldMs, achievedRate);
+                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms, active %u Hz%s)\n",
+                                   temp_refreshRate, check_refresh_rate, heldMs, achievedRate,
+                                   fineRate ? ", measured" : "");
                 else
-                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms)\n",
-                                   temp_refreshRate, check_refresh_rate, heldMs);
+                    SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms%s)\n",
+                                   temp_refreshRate, check_refresh_rate, heldMs,
+                                   fineRate ? ", measured" : "");
                 pendingRefreshRate = 0;
                 // A drop to the floor is the only one worth second-guessing: below it
                 // there is no room left to move down, and the panel holding the app
-                // down looks exactly like a slow game. Arm one test back to the rate we
-                // just left; a drop between 60/55/50 above the floor is a real one.
-                probeArmed = (check_refresh_rate < temp_refreshRate) &&
+                // down looks exactly like a slow game. Arm one test, and keep the
+                // excursion small - a 50 -> 60 jump is far more visible than 50 -> 55.
+                probeArmed = !fineRate &&
+                             (check_refresh_rate < temp_refreshRate) &&
                              (check_refresh_rate == DISPLAY_SYNC_MIN_RATE) &&
                              (temp_refreshRate <= HandheldModeRefreshRateAllowed.max) &&
                              (temp_refreshRate != probeFailedRate) &&
                              (probeCount < probeLimit);
-                if (probeArmed)
-                    probeTarget = temp_refreshRate;
+                if (probeArmed) {
+                    uint32_t up = DISPLAY_SYNC_MIN_RATE + REFRESH_RATE_SMALL_DELTA;
+                    if (up > temp_refreshRate)
+                        up = temp_refreshRate;
+                    if (up > HandheldModeRefreshRateAllowed.max)
+                        up = HandheldModeRefreshRateAllowed.max;
+                    probeTarget = up;
+                }
             }
         }
         else {
@@ -627,6 +685,7 @@ void Initialize() {
     if (SaltyNX_LogLevel() != SALTYNX_LOG_SILENT)
         SaltyNX_printf(APP_NAME ": logging is opt-in: log.flag writes decisions, log.full.flag adds the IPC trace\n");
     loadTestSweep();
+    loadFineSyncFlag();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);

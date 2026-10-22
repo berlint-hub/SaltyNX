@@ -1447,6 +1447,7 @@ void serviceThreadDisplaySync(void* portHandle)
             u64 command = UINT64_MAX;
             u32 magic_index = 0;
             bool magic_found = false;
+            bool id_found = false;
 
             for (u32 i = 0; i < raw_word_count; i++)
             {
@@ -1460,7 +1461,24 @@ void serviceThreadDisplaySync(void* portHandle)
 
             if (!magic_found)
             {
-                command = UINT64_MAX;
+                // The window does not always start where the client's payload does: the
+                // kernel prepends the descriptor words it needs, and with a 32 B payload
+                // the pair can land outside the copied region. This endpoint serves two
+                // commands with distinct ids, so look for those directly before giving
+                // up - a 32 B request from NetherSX2 is a rate query and would otherwise
+                // be answered with an error on every poll.
+                for (u32 i = 0; i + 1 < raw_word_count; i++)
+                {
+                    u64 word = 0;
+                    memcpy(&word, raw_words + i, sizeof(word));
+                    if (word == (u64)handleService_GetDisplayRefreshRate ||
+                        word == (u64)handleService_GetSharedMemoryHandle)
+                    {
+                        command = word;
+                        id_found = true;
+                        break;
+                    }
+                }
             }
             else if (raw_word_count < magic_index + 4)
             {
@@ -1492,7 +1510,7 @@ void serviceThreadDisplaySync(void* portHandle)
                     break;
                 default: {
                     SERVICE_LOG_MIN("unsupported command 0x%lx (magic %s, raw %u B)",
-                                command, magic_found ? "found" : "missing", raw_bytes);
+                                command, magic_found ? "found" : (id_found ? "found by id" : "missing"), raw_bytes);
                     IpcCommand c;
                     ipcInitialize(&c);
                     struct {
