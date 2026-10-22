@@ -133,6 +133,30 @@ SaltyNX: display-sync: refresh rate 50 -> 45 Hz requested (target held 20004 ms,
 
 Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated. `present_fps` close to `display_rate` in the client diagnostic is not proof of lockstep - a free-running 50 FPS loop on a 45 Hz panel also reports ~50.
 
+### Testing whether the panel takes a rate the clients cannot ask for
+
+Neither FPSLocker nor NetherSX2 can publish anything outside their own 5 Hz table, so "does this panel lock at 49 Hz?" cannot be answered from the client side. The sysmodule can answer it itself: put a list of rates in
+
+```
+sdmc:/SaltySD/flags/test_rates.txt        45 46 47 48 49 50 51 52
+```
+
+and reboot. While an application is running, SaltyNX steps through the list five seconds apart, printing what the PLLD registers report back:
+
+```
+SaltyNX: sweep: 8 rate(s) from sdmc:/SaltySD/flags/test_rates.txt, 5 s apart
+SaltyNX: sweep: 48 Hz requested from 47 Hz, active 48 Hz
+SaltyNX: sweep: 51 Hz requested from 50 Hz, active 51 Hz
+SaltyNX: sweep: 49 Hz requested from 48 Hz, active 48 Hz  <-- did not land
+SaltyNX: sweep: done, back to 60 Hz (active 60 Hz)
+```
+
+`active` is read back from the PLLD, so it says what the panel is really doing. `did not land` means the panel accepted the write but reports a different rate; `refused` means `SetDisplayRefreshRate()` itself returned false. Without the file nothing happens, so it cannot be left on by accident and it cannot fight FPSLocker.
+
+Display sync is suspended for the duration of the sweep and resumes afterwards, and the sweep is skipped in docked mode where a different set of modes applies.
+
+What this does **not** test: the sync loop itself at 1 Hz granularity. That needs a client that publishes 48/49/51/52, and NetherSX2 quantises to 5 Hz. The sweep proves the panel side of the question - whether the hardware and the PLLD solver can hit those rates at all.
+
 ### The handheld window is 50/55/60, never lower
 
 `updateRefreshRateForApp()` used to follow whatever the client published. Since 2.1.18 a measured target below 50 Hz is ignored in handheld mode and 50 is applied instead:

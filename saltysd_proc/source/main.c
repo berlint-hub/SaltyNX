@@ -306,6 +306,98 @@ static const uint32_t probeLimit = 3; // cannot ping-pong the panel forever
 static u64 sameRateSince = 0;
 static bool minRateClampLogged = false;
 
+// ---------------------------------------------------------------------------
+// Rate sweep: answers "does this panel actually take 49 Hz?" without needing a
+// client that can ask for it.
+//
+// Neither FPSLocker nor NetherSX2 can publish anything outside their 5 Hz table, so
+// the only way to find out whether the panel locks at 48, 49, 51 or 52 is to drive it
+// from here. Put the rates in
+//
+//     sdmc:/SaltySD/flags/test_rates.txt        45 46 47 48 49 50 51 52
+//
+// and reboot. While an application runs, the sysmodule steps through them five seconds
+// apart, printing what the hardware reports back through the PLLD registers. Without
+// the file nothing happens at all. Display sync is suspended for the duration so the
+// two cannot fight over the panel, and the rate is returned to 60 Hz when the list
+// runs out.
+#define TEST_SWEEP_FILE    "sdmc:/SaltySD/flags/test_rates.txt"
+#define TEST_SWEEP_STEP_MS 5000ULL
+#define TEST_SWEEP_MAX     16
+
+static uint32_t testSweepRates[TEST_SWEEP_MAX];
+static uint32_t testSweepCount = 0;
+static uint32_t testSweepIndex = 0;
+static u64 testSweepNextStep = 0;
+static bool testSweepDone = false;
+
+static void loadTestSweep() {
+    FILE* f = fopen(TEST_SWEEP_FILE, "r");
+    if (!f)
+        return;
+    char buf[128] = {0};
+    const size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    uint32_t value = 0;
+    bool any = false;
+    for (size_t i = 0; i <= got; i++) {
+        const char c = (i < got) ? buf[i] : ' ';
+        if (c >= '0' && c <= '9') {
+            if (value <= 1000)
+                value = value * 10 + (uint32_t)(c - '0');
+            any = true;
+        }
+        else if (any) {
+            if (value >= 1 && value <= 240 && testSweepCount < TEST_SWEEP_MAX)
+                testSweepRates[testSweepCount++] = value;
+            value = 0;
+            any = false;
+        }
+    }
+    if (!testSweepCount)
+        return;
+    SaltyNX_printf(APP_NAME ": sweep: %u rate(s) from " TEST_SWEEP_FILE ", %u s apart\n",
+                   testSweepCount, (u32)(TEST_SWEEP_STEP_MS / 1000));
+}
+
+// Returns true when the sweep owns the panel this tick.
+static bool runTestSweep() {
+    // Hands the panel back to the normal logic once the list has been walked, so the
+    // sweep cannot leave display sync suspended for the rest of the session.
+    if (!testSweepCount || isDocked || testSweepDone)
+        return false;
+    const u64 now = svcGetSystemTick();
+    if (testSweepNextStep && now < testSweepNextStep)
+        return true;
+
+    if (testSweepIndex >= testSweepCount) {
+        testSweepDone = true;
+        uint32_t achieved = 0;
+        SetDisplayRefreshRate(60);
+        if (GetDisplayRefreshRate(&achieved, true))
+            SaltyNX_printf(APP_NAME ": sweep: done, back to 60 Hz (active %u Hz)\n", achieved);
+        else
+            SaltyNX_printf(APP_NAME ": sweep: done, back to 60 Hz\n");
+        return true;
+    }
+
+    const uint32_t want = testSweepRates[testSweepIndex++];
+    uint32_t before = 0;
+    GetDisplayRefreshRate(&before, true);
+    const bool setOk = SetDisplayRefreshRate(want);
+    uint32_t after = 0;
+    const bool readOk = GetDisplayRefreshRate(&after, true);
+    if (readOk)
+        SaltyNX_printf(APP_NAME ": sweep: %u Hz requested from %u Hz, active %u Hz%s\n",
+                       want, before, after,
+                       (after == want) ? "" : ((setOk) ? "  <-- did not land" : "  <-- refused"));
+    else
+        SaltyNX_printf(APP_NAME ": sweep: %u Hz requested from %u Hz, readback failed (set %s)\n",
+                       want, before, setOk ? "ok" : "refused");
+    testSweepNextStep = now + TEST_SWEEP_STEP_MS * SV_TICKS_PER_MS;
+    return true;
+}
+
 void cleanAppData() {
     lastAppPID = -1;
     nx_fps = 0;
@@ -319,6 +411,9 @@ void cleanAppData() {
     probeCount = 0;
     sameRateSince = 0;
     minRateClampLogged = false;
+    testSweepIndex = 0;
+    testSweepNextStep = 0;
+    testSweepDone = false;
     uintptr_t shmem = (uintptr_t)shmemGetAddr(&_sharedMemory);
     if (shmem) {
         memset((void*)(shmem+4), 0, shmem_size-4);
@@ -346,7 +441,10 @@ void cleanAppData() {
 }
 
 void updateRefreshRateForApp() {
-    if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
+    if (runTestSweep()) {
+        pendingRefreshRate = 0;
+    }
+    else if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
@@ -528,6 +626,7 @@ void Initialize() {
     // it is short. Only printed when logging is on at all.
     if (SaltyNX_LogLevel() != SALTYNX_LOG_SILENT)
         SaltyNX_printf(APP_NAME ": logging is opt-in: log.flag writes decisions, log.full.flag adds the IPC trace\n");
+    loadTestSweep();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);
