@@ -291,48 +291,9 @@ static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not tes
 static uint32_t probeTarget = 0;
 static u64 probeStart = 0;
 static uint32_t probeFailedRate = 0;
-static uint32_t highestRequestedRate = 0;
+static uint32_t probeCount = 0;      // capped, so a game wobbling on the boundary
+static const uint32_t probeLimit = 3; // cannot ping-pong the panel forever
 static u64 sameRateSince = 0;
-
-// Testing hook: sdmc:/SaltySD/flags/refresh_rate.txt holding one integer drives the
-// panel to exactly that rate and ignores every other source. Without a client that
-// can publish a non-standard target this is the only way to answer "does my panel
-// actually lock at 48 Hz?" - the log reports what the hardware ended up at.
-#define FORCED_RATE_FILE "sdmc:/SaltySD/flags/refresh_rate.txt"
-
-static uint32_t forcedRefreshRate = 0;
-static u64 lastForcedAttempt = 0;
-
-static void loadForcedRefreshRate() {
-    FILE* f = fopen(FORCED_RATE_FILE, "r");
-    if (!f)
-        return;
-    // Hand-rolled parse on purpose: fscanf() drags the whole scanf engine into the
-    // sysmodule and grows the nsp by ~60 KB, which is not worth one integer.
-    char buf[16] = {0};
-    const size_t got = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (!got)
-        return;
-    uint32_t value = 0;
-    bool any = false;
-    for (size_t i = 0; i < got; i++) {
-        const char c = buf[i];
-        if (c >= '0' && c <= '9') {
-            if (value > 1000) return;
-            value = value * 10 + (uint32_t)(c - '0');
-            any = true;
-        }
-        else if (any) break;
-        else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-        else return;
-    }
-    if (!any || value < 1 || value > 240)
-        return;
-    forcedRefreshRate = value;
-    SaltyNX_printf(APP_NAME ": forcing the panel to %u Hz from " FORCED_RATE_FILE "\n",
-                   forcedRefreshRate);
-}
 
 void cleanAppData() {
     lastAppPID = -1;
@@ -344,7 +305,7 @@ void cleanAppData() {
     probeFromRate = 0;
     probeTarget = 0;
     probeFailedRate = 0;
-    highestRequestedRate = 0;
+    probeCount = 0;
     sameRateSince = 0;
     uintptr_t shmem = (uintptr_t)shmemGetAddr(&_sharedMemory);
     if (shmem) {
@@ -373,29 +334,10 @@ void cleanAppData() {
 }
 
 void updateRefreshRateForApp() {
-    if (forcedRefreshRate) {
-        uint32_t current = 0;
-        const u64 now = svcGetSystemTick();
-        const bool stillOff = GetDisplayRefreshRate(&current, true) && current != forcedRefreshRate;
-        if (stillOff && (lastForcedAttempt == 0 || now - lastForcedAttempt >= 3000ULL * SV_TICKS_PER_MS)) {
-            lastForcedAttempt = now;
-            uint32_t achieved = 0;
-            SetDisplayRefreshRate(forcedRefreshRate);
-            if (GetDisplayRefreshRate(&achieved, true))
-                SaltyNX_printf(APP_NAME ": display-sync: forced %u Hz requested, active %u Hz\n",
-                               forcedRefreshRate, achieved);
-            else
-                SaltyNX_printf(APP_NAME ": display-sync: forced %u Hz requested, readback failed\n",
-                               forcedRefreshRate);
-        }
-        pendingRefreshRate = 0;
-    }
-    else if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
+    if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
-        if (requestedRate > highestRequestedRate)
-            highestRequestedRate = requestedRate;
         uint32_t check_refresh_rate = requestedRate ? requestedRate : refreshRate;
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
@@ -478,14 +420,15 @@ void updateRefreshRateForApp() {
                     SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms)\n",
                                    temp_refreshRate, check_refresh_rate, heldMs);
                 pendingRefreshRate = 0;
-                // If this landed below a rate the app has asked for before, the drop
-                // may be the panel dragging the app down rather than the app slowing
-                // down. Arm one test for it.
-                probeArmed = (check_refresh_rate < highestRequestedRate) &&
-                             (highestRequestedRate <= HandheldModeRefreshRateAllowed.max) &&
-                             (check_refresh_rate != probeFailedRate);
+                // A small drop may be the panel dragging the app down rather than the
+                // app slowing down, and there is no way to tell the two apart after the
+                // fact. Arm one test that returns to the rate we just left.
+                probeArmed = (check_refresh_rate < temp_refreshRate) &&
+                             (temp_refreshRate <= HandheldModeRefreshRateAllowed.max) &&
+                             (check_refresh_rate != probeFailedRate) &&
+                             (probeCount < probeLimit);
                 if (probeArmed)
-                    probeTarget = highestRequestedRate;
+                    probeTarget = temp_refreshRate;
             }
         }
         else {
@@ -501,8 +444,9 @@ void updateRefreshRateForApp() {
                     probeFromRate = check_refresh_rate;
                     probeStart = now;
                     sameRateSince = 0;
+                    probeCount++;
                     SetDisplayRefreshRate(up);
-                    SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app asked for earlier\n",
+                    SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app held before\n",
                                    check_refresh_rate, up);
                 }
             }
@@ -558,7 +502,6 @@ void Initialize() {
     ABORT_IF_FAILED(fsInitialize(), 2);
     ABORT_IF_FAILED(fsdevMountSdmc(), 3);
     SaltyNX_printf(APP_NAME " " APP_VERSION ": got SD card.\n");
-    loadForcedRefreshRate();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);

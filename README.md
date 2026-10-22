@@ -116,14 +116,13 @@ A drop is the only direction that can become permanent. The panel slows down, th
 
 A rise cannot get stuck that way, because the app can always correct it down. So the way out is to walk the panel back up once and watch what the app does:
 
-- the sysmodule remembers the highest rate the app has ever *asked for* (`highestRequestedRate`);
-- an applied change that lands below that rate arms one test;
-- after 10 s with nothing changing, the panel is moved back up to that rate for up to 12 s;
+- an applied *small drop* (at most 5 Hz) arms one test;
+- after 10 s with nothing changing, the panel is moved back to the rate it just left, for up to 12 s;
 - if the published target follows upward, the low reading was the panel's ceiling and the higher rate is kept;
 - if it does not, the game really cannot fill the panel, the old rate is restored and that rate is never tested again for this app.
 
 ```
-SaltyNX: display-sync: testing 45 Hz against 50 Hz, which the app asked for earlier
+SaltyNX: display-sync: testing 45 Hz against 50 Hz, which the app held before
 SaltyNX: display-sync: 45 Hz was locked in, target followed to 50 Hz (active 50 Hz)
 ```
 
@@ -133,9 +132,11 @@ or
 SaltyNX: display-sync: 45 Hz is real, back from the test (target 45 Hz, active 45 Hz)
 ```
 
-Only a rate the client actually published counts. The 60 Hz default that stands in for "no target yet" is deliberately excluded, otherwise every launch would test its way away from the correct rate. A 45 FPS game that never asked for more sees no test at all.
+At most three tests run per session, so a game that wobbles on the boundary cannot ping-pong the panel forever. The test returns to the rate the panel was actually on, not to the highest rate ever seen. The 60 Hz a client publishes before the game starts would otherwise send the panel to 60 for the whole test. A game that never dropped from a higher rate is never tested, and a rate that failed once is never tried again in the same session.
 
 ### Any integer refresh rate, not just multiples of five
+
+The handheld panel is driven at 50 Hz for PAL titles and 60 Hz otherwise, and both are multiples of five, so this matters less than it sounds - but the 5 Hz ladder was never a hardware limit and the code no longer pretends it is. Nothing asks for an in-between rate today; the solver is there so the arithmetic is right if something ever does.
 
 `setPLLDHandheldRefreshRate()` used to do this:
 
@@ -170,7 +171,7 @@ Since 2.1.13 `plldSolveForRate()` does that, and the whole ladder is exact:
 | 49 | 19 | +3328 |
 | 50 | 20 | −1536 |
 
-48 Hz is the cleanest point of all - an exact integer divider with no fractional correction. The old code turned a 48 Hz request into `DIVN = 18` (45 Hz) with a `+8192` correction, which is half a step past the modulator's range, so the panel silently stayed at 45.
+The old code turned a 48 Hz request into `DIVN = 18` (45 Hz) with a `+8192` correction, which is half a step past the modulator's range, so the panel silently stayed at 45 and the caller got `true` back.
 
 Two related changes in the same version:
 
@@ -180,25 +181,6 @@ Two related changes in the same version:
 Because 1 Hz granularity is now possible, `updateRefreshRateForApp()` ignores a 1 Hz difference outright - it is always measurement noise and never worth a mode switch.
 
 Still untouched: `correctOledGamma()` only knows 45/50/55/60. 50 and 55 share the same ELVSS values, so an in-between rate simply keeps what was last applied; nothing is restored.
-
-### Testing one arbitrary rate without a client
-
-Neither FPSLocker nor NetherSX2 can ask for a rate outside their own 5 Hz table, so there is no way to answer "does this panel lock at 48 Hz?" from the client side. Since 2.1.14 the sysmodule reads an optional file instead:
-
-```
-sdmc:/SaltySD/flags/refresh_rate.txt      # one integer, e.g. 48
-```
-
-While that file exists, the panel is driven to exactly that rate and every other source (FPSLocker block, display sync) is ignored. The first attempt and any retry are logged with the rate the hardware actually reports back:
-
-```
-SaltyNX: forcing the panel to 48 Hz from sdmc:/SaltySD/flags/refresh_rate.txt
-SaltyNX: display-sync: forced 48 Hz requested, active 48 Hz
-```
-
-`active` is read back from the PLLD registers, so it says what the panel is really running at, not what was requested. A value that never matches means the panel refused that clock - it retries (and logs) at most once every 3 s, so a log full of `forced 48 Hz requested, active 45 Hz` is itself the answer.
-
-Delete the file and reboot to go back to normal behaviour.
 
 ### A client can lose its command id in the raw IPC header
 
