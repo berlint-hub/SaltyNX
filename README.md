@@ -88,6 +88,20 @@ Result codes a client can see when it connects to `NethFPS`:
 | `0x10801` | `KernelError_LimitReached` (libnx: `OutOfResource`) | the name lookup succeeded, but the client process could not reserve a session from its own resource limit: the endpoint is fine, the client is out of session slots |
 | `0x10601` | `KernelError_PortClosed` | the port is still named but its server side is gone (a crashed/restarted sysmodule) |
 
+### Do not follow a jittery target every second
+
+`updateRefreshRateForApp()` follows `NxFpsSharedBlock::FPSlocked` and calls `SetDisplayRefreshRate()` as soon as the value differs. That is correct for FPSLocker, where the value is a stable user choice, but a client that derives the target from a *measured* frame cadence (NetherSX2 does) wobbles by a few Hz every second - 45/50/55 around a 50 FPS game.
+
+Each of those calls is a real panel mode switch. The picture hitches, the hitch perturbs the measured cadence, and the mismatch feeds itself, so the game feels like it keeps slowing down.
+
+Since 2.1.11 a small correction (<= 5 Hz) has to hold for 5 s before the panel follows it, while a real change (new FPSLocker target, docked switch) still applies after 1.5 s. Applied switches are logged:
+
+```
+SaltyNX: display-sync: refresh rate 60 -> 50 Hz (target held 5104 ms)
+```
+
+Note that this only stops the flapping. Smooth pacing still needs the *client* to present in lockstep with the panel: with Vsync off (`swap interval 0`, immediate present) the app renders slightly faster or slower than the panel and one frame per few seconds is dropped or repeated.
+
 ### A client can lose its command id in the raw IPC header
 
 The raw payload of an IPC request does not start at `TLS+0x20`; it starts right after the header (`TLS+0x14` for a request that carries a PID descriptor), and the client declares its length in the second control word. If a client writes its payload at `TLS+0x20` but declares less than `0x0C+16` bytes, the kernel copies only the magic word and the command id never reaches the server.

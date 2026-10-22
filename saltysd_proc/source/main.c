@@ -269,6 +269,24 @@ void cleanAppData() {
     }
 }
 
+// A client that derives its target from a *measured* frame cadence wobbles by a
+// few Hz every second (45/50/55 around a 50 FPS game). Following every change is
+// what makes display sync feel broken: every SetDisplayRefreshRate is a real panel
+// mode switch, so the picture hitches - and the hitch changes the measured cadence
+// again, which makes the next switch even more likely.
+//
+// A small correction (<= 5 Hz around the current rate) therefore has to survive for
+// several seconds before the panel follows it, while a real change (a new FPSLocker
+// target, docked/handheld switch) still applies quickly.
+#define REFRESH_RATE_SMALL_DELTA  5u
+#define REFRESH_RATE_SMALL_MS  5000ULL
+#define REFRESH_RATE_LARGE_MS  1500ULL
+#define SV_TICKS_PER_MS       19200ULL
+
+static uint32_t pendingRefreshRate = 0;
+static u64 pendingRefreshSince = 0;
+static u64 pendingRefreshRequired = 0;
+
 void updateRefreshRateForApp() {
     if ((!isDocked && displaySync) || (isDocked && displaySyncDocked)) {
         uint32_t temp_refreshRate = 0;
@@ -286,8 +304,29 @@ void updateRefreshRateForApp() {
                 check_refresh_rate = 60;
             }
         }
-        if (temp_refreshRate != check_refresh_rate)
-            SetDisplayRefreshRate(check_refresh_rate);
+        if (temp_refreshRate != check_refresh_rate) {
+            const u64 now = svcGetSystemTick();
+            if (check_refresh_rate != pendingRefreshRate) {
+                const uint32_t delta = (check_refresh_rate > temp_refreshRate)
+                                     ? (check_refresh_rate - temp_refreshRate)
+                                     : (temp_refreshRate - check_refresh_rate);
+                pendingRefreshRate = check_refresh_rate;
+                pendingRefreshSince = now;
+                pendingRefreshRequired = ((delta <= REFRESH_RATE_SMALL_DELTA)
+                                          ? REFRESH_RATE_SMALL_MS
+                                          : REFRESH_RATE_LARGE_MS) * SV_TICKS_PER_MS;
+            }
+            else if (now - pendingRefreshSince >= pendingRefreshRequired) {
+                SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz (target held %u ms)\n",
+                               temp_refreshRate, check_refresh_rate,
+                               (u32)((now - pendingRefreshSince) / SV_TICKS_PER_MS));
+                SetDisplayRefreshRate(check_refresh_rate);
+                pendingRefreshRate = 0;
+            }
+        }
+        else {
+            pendingRefreshRate = 0;
+        }
     }
     if (!isDocked && nx_fps && nx_fps->FPSlocked > HandheldModeRefreshRateAllowed.max) {
         nx_fps->FPSlocked = HandheldModeRefreshRateAllowed.max;
