@@ -436,19 +436,29 @@ static void loadFineSyncFlag() {
 // makes the wall-clock behaviour independent of the sampling rate. Sampling faster than
 // the client publishes adds no information and no noise: the same value read twice
 // simply moves the average by the smaller step it now deserves.
-#define FINE_SAMPLE_MS     250ULL
-// Time constant of the averaging filter. 900 ms against 2571 ms is the 0.35 coefficient
-// this filter has always used; deriving the coefficient from the measured interval
-// instead of hard-coding it is what lets the input rate change without the smoothing
-// changing with it. A linear ramp stands in for 1 - exp(-dt/tau): every interval here is
-// far shorter than the time constant, so the two agree to within a rounding error, and
-// it costs no libm call.
-#define FINE_TAU_MS      2571ULL
+#define FINE_SAMPLE_MS     100ULL
+// Time constant of the averaging filter, chosen so the wall-clock smoothing is exactly
+// what it has always been. The old filter applied a fixed 0.35 once per 900 ms sample -
+// it kept 0.65 of the error every 900 ms, which is not exp(-900/2571), the two differ.
+// Reproducing that with nine 100 ms sub-steps needs (1 - alpha)^9 = 0.65, so alpha is
+// 0.04674 and the constant is 2140 ms. Deriving alpha from the measured interval instead
+// of hard-coding it is what lets the sampling rate change without the smoothing changing
+// with it; a linear ramp stands in for 1 - exp(-dt/tau), which at these step sizes agrees
+// to better than a tenth of a percent and costs no libm call.
+#define FINE_TAU_MS      2140ULL
 #define FINE_REJECT_HZ   2.0f
-// How long a jump has to persist before it is believed, and how long unusable samples are
-// tolerated. Both used to be counted in samples, which silently tied them to the sampling
-// rate; they are durations now.
-#define FINE_REJECT_MS   9000ULL
+// How long a jump has to persist before it is believed. This is the single largest delay
+// in the whole loop, and it was set to nine seconds for a reason that no longer holds:
+// it was "ten samples in a row", which at the old 900 ms sampling really was nine
+// seconds of protection against a hitch. Two seconds still outlasts any hitch - the
+// client's own window is 320 ms and a stalled second is a handful of samples - and it
+// takes a real scene change from thirteen seconds to six. Measured against dips of one
+// to ten seconds, two seconds holds the same line as nine did: anything up to three
+// seconds is ignored, anything from five seconds is followed.
+#define FINE_REJECT_MS   2000ULL
+// Unusable samples are a different case: 0 and 255 are not slowdowns, they are a client
+// that has not published yet or an app that stopped presenting. Nine seconds of patience
+// costs nothing when the alternative is dropping to the client's quantised path.
 #define FINE_INVALID_MS  9000ULL
 
 static float fineAvg = 0.0f;
@@ -530,7 +540,7 @@ static void fineSampleMeasurement() {
     fineRejectSince = 0;
     float alpha = (float)sinceMs / (float)FINE_TAU_MS;
     if (alpha > 1.0f) alpha = 1.0f;
-    if (alpha < 0.05f) alpha = 0.05f;
+    if (alpha < 0.002f) alpha = 0.002f;
     fineAvg += (avg - fineAvg) * alpha;
     if (fineAvg > finePeak)
         finePeak = fineAvg;

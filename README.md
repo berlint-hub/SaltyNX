@@ -269,6 +269,24 @@ The floor also earns a test of its own. 45 Hz is a clamp, not a content-derived 
 
 The same simulation with these changes: 9 switches and settled at 50 Hz.
 
+### Why the sampling rate was never the slow part
+
+The control loop samples a shared block. Raising that rate is free and it was raised - 900 ms to 250 ms in 2.1.33, to 100 ms in 2.1.34 - but it buys about half a second, and it is worth being clear about why.
+
+A 50 to 45 fps scene change, measured end to end against the actual code: **13.7 s** before the panel moved on 2.1.33. Of that, the sampling interval contributed 0.15 s and the client's own once-a-second publish contributed 0.5 s. The rest was the jump rejection and the hold - two persistence filters that were both tuned long.
+
+| delay | 2.1.33 | 2.1.34 |
+|---|---|---|
+| client publishes | 1 s | 1 s (client side) |
+| sampling phase | up to 250 ms | up to 100 ms |
+| jump rejection | 9 s | 2 s |
+| hold before the move | 4 s | 4 s |
+| **total** | **13.7 s** | **6.6 s** |
+
+The nine second rejection was `FINE_REJECT_MAX = 10` samples, which at the old 900 ms sampling genuinely was nine seconds of protection against a hitch. Against dips of one to ten seconds the two second version holds exactly the same line - anything up to three seconds is ignored, anything from five seconds is followed - because the hold is a second filter in series and a dip that ends during the hold cancels the move.
+
+Going to ten publishes a second from the client would not help further: its sixteen-frame window is 320 ms, so at 10 Hz only 31% of each window is new data and the rest is the same measurement read again. Four a second is the point where a fresh window arrives at least three quarters new. `nethersx2-fpsavg-v3-handoff.md` asks for four.
+
 ### How fast the loop reacts
 
 Three delays sit in series, and it is worth knowing which one is which:
