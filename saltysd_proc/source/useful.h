@@ -84,39 +84,9 @@ static inline bool file_or_directory_exists(const char *filename)
     return stat(filename, &buffer) == 0 ? true : false;
 }
 
-// Logging is opt-in, and it comes in two sizes:
-//
-//   sdmc:/SaltySD/flags/log.flag        decisions, warnings and boot information
-//   sdmc:/SaltySD/flags/log.full.flag   everything, including one line per IPC call
-//
-// Neither file: silent. The second flag exists because the full trace writes a line for
-// every fopen/fread/memcpy the game makes through SaltyNX - that is thousands of writes
-// to the same SD card the game streams its ISO from, which is measurable in the frame
-// pacing it is supposed to be diagnosing.
-//
-// The flags are sampled once a minute rather than once per line: the stat() itself was
-// per line before, and it lands on the same card.
-#define SALTYNX_LOG_SILENT  0
-#define SALTYNX_LOG_MINIMAL 1
-#define SALTYNX_LOG_FULL    2
-
-static inline int SaltyNX_LogLevel(void)
+static inline void SaltyNX_printf(const char* format, ...)
 {
-	static int cached = -1;
-	static uint64_t lastCheck = 0;
-	const uint64_t now = svcGetSystemTick();
-	if (cached >= 0 && (now - lastCheck) < (60ULL * systemtickfrequency))
-		return cached;
-	lastCheck = now;
-	if (file_or_directory_exists("sdmc:/SaltySD/flags/log.full.flag")) cached = SALTYNX_LOG_FULL;
-	else if (file_or_directory_exists("sdmc:/SaltySD/flags/log.flag")) cached = SALTYNX_LOG_MINIMAL;
-	else cached = SALTYNX_LOG_SILENT;
-	return cached;
-}
-
-static inline void SaltyNX_vprintf(int level, const char* format, ...)
-{
-	if (SaltyNX_LogLevel() < level) return;
+	if (file_or_directory_exists("sdmc:/SaltySD/flags/log.flag") == false) return;
 	
 	char buffer[256];
 
@@ -150,11 +120,6 @@ static inline void SaltyNX_vprintf(int level, const char* format, ...)
 		fclose(f);
 	}
 }
-
-// Ordinary lines: shown with log.flag.
-#define SaltyNX_printf(...)      SaltyNX_vprintf(SALTYNX_LOG_MINIMAL, __VA_ARGS__)
-// Trace lines: only with log.full.flag.
-#define SaltyNX_printf_trace(...) SaltyNX_vprintf(SALTYNX_LOG_FULL, __VA_ARGS__)
 
 
 #define debug_log(...) \

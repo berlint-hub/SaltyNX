@@ -479,55 +479,6 @@ double strtod(const char* str, char** endptr) {
 	return ((strtod_0)(strtod_ptr))(str, endptr);
 }
 
-/* The one thing this fork changes inside the injected Core, and it earns its place:
- * NetherSX2 reported nethfps_rc=0x10801 (KernelError_OutOfResource) on every connect
- * while the endpoint sat idle with free slots, and the cause was the hijacked process
- * carrying a session limit of one - Core's own bootstrap took it, so the app inside the
- * same process could never open a session of its own.
- *
- * A probe that connected to ports from inside every game used to live here as well.
- * It answered that question, the answer is above, and it is gone: nothing in a shipped
- * Core should be touching named ports in a retail game's process. */
-#if defined(SWITCH32) || defined(OUNCE32)
-typedef u64 rl_value_t;
-#else
-typedef s64 rl_value_t;
-#endif
-/* LimitableResource_SessionCountMax in current libnx, LimitableResource_Sessions
- * in the old libnx32_min header. */
-#define RL_SESSIONS ((LimitableResource)4)
-
-/* How many sessions this process may hold at the same time. The process SaltyNX
- * hijacks can come with a tiny limit - NetherSX2 only got a single session, which
- * SaltyNX Core occupies while it bootstraps, so the app itself could never connect
- * to any IPC port (it reported 0x10801 = KernelError_OutOfResource on every try).
- * svcSetResourceLimitLimitValue only refuses values below the current usage, so
- * the limit is raised before Core starts using the SaltySD port. */
-#define SALTYNX_SESSION_LIMIT 32
-
-static rl_value_t g_sessionLimitBefore = -1;
-static rl_value_t g_sessionLimitAfter  = -1;
-
-static void SaltySDCore_RaiseSessionLimit(void)
-{
-	u64 resourceLimitHandle = 0;
-	if (R_FAILED(svcGetInfo(&resourceLimitHandle, InfoType_ResourceLimit, INVALID_HANDLE, 0)) ||
-	    !resourceLimitHandle)
-		return;
-
-	Handle limit = (Handle)resourceLimitHandle;
-	rl_value_t current = -1;
-	if (R_SUCCEEDED(svcGetResourceLimitLimitValue(&current, limit, RL_SESSIONS)))
-	{
-		g_sessionLimitBefore = current;
-		g_sessionLimitAfter  = current;
-		if (current < SALTYNX_SESSION_LIMIT &&
-		    R_SUCCEEDED(svcSetResourceLimitLimitValue(limit, RL_SESSIONS, SALTYNX_SESSION_LIMIT)))
-			g_sessionLimitAfter = SALTYNX_SESSION_LIMIT;
-	}
-	svcCloseHandle(limit);
-}
-
 int main(int argc, char *argv[])
 {
 	Result ret;
@@ -537,15 +488,8 @@ int main(int argc, char *argv[])
 
 	SaltySDCore_RegisterExistingModules();
 	strtod_ptr = SaltySDCore_FindSymbolBuiltin("strtod");
-
-	/* Make room for both Core and the app before anyone opens a session. */
-	SaltySDCore_RaiseSessionLimit();
-
 	ret = SaltySD_Init();
 	if (ret) goto fail;
-
-	SaltySDCore_printf(MODULE_NAME " " APP_VERSION ": session limit %d -> %d\n",
-	                   (int)g_sessionLimitBefore, (int)g_sessionLimitAfter);
 
 	SaltySDCore_printf(MODULE_NAME " " APP_VERSION ": restoring code...\n");
 	ret = SaltySD_Restore();
@@ -593,7 +537,7 @@ int main(int argc, char *argv[])
 
 	ret = SaltySD_Deinit();
 	if (ret) goto fail;
-
+	
 	setupELFHeap();
 	__libnx_exit(0);
 

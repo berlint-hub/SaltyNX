@@ -26,12 +26,3 @@ extern uint64_t clkVirtAddr;
 extern struct NxFpsSharedBlock* nx_fps;
 extern uintptr_t game_start_address;
 extern s64 lastAppPID;
-// Set once an external display-sync client - today only NetherSX2 - has connected to this
-// fork's private endpoint during the current app session. A native game never does, and
-// the flag is what tells "FPSlocked is a user's choice" apart from "FPSlocked is somebody's
-// measurement", which matters because those two must not be treated alike.
-extern bool displaySyncClientSeen;
-
-// A copy of the 64-bit bootstrap ELF, read once at boot with as many retries as it takes.
-// The per-launch read is what failed on an idle SD card and cost the whole hijack.
-bool getBootstrappedElf(u8** buf, size_t* size);

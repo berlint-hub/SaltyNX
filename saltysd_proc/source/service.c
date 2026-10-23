@@ -1,5 +1,4 @@
 #include "shared.h"
-#include "display_sync.h"
 #include "ipc.h"
 #include <string.h>
 #include <stdlib.h>
@@ -10,15 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 
-// Trace: one line per IPC call, including every fopen/fread/memcpy the game makes.
-// Only written with sdmc:/SaltySD/flags/log.full.flag - the volume is thousands of
-// lines per minute on the same SD card the game is reading.
 #define SERVICE_LOG(fmt, ...) \
-    SaltyNX_printf_trace(APP_NAME ": [%s] " fmt "\n", __func__, ##__VA_ARGS__)
-
-// The handful of lines that explain why display sync did or did not do something.
-// Written with the ordinary sdmc:/SaltySD/flags/log.flag.
-#define SERVICE_LOG_MIN(fmt, ...) \
     SaltyNX_printf(APP_NAME ": [%s] " fmt "\n", __func__, ##__VA_ARGS__)
 
 #define SALTYNX_RESULT(id, val) MAKERESULT(MODULE_SALTYNX, 9000 + ((id) * 10) + (val))
@@ -417,7 +408,7 @@ static Result serviceSetDisplayRefreshRate() {
         ret = 0;
     }
     else ret = SALTYNX_RESULT(handleService_SetDisplayRefreshRate, 1);
-    SERVICE_LOG_MIN("refresh rate requested: %d, ret: 0x%x", refreshRate_temp, ret);
+    SERVICE_LOG("refresh rate requested: %d, ret: 0x%x", refreshRate_temp, ret);
     return ret;
 }
 
@@ -440,7 +431,7 @@ static Result serviceSetDisplaySync() {
     else {
         remove("sdmc:/SaltySD/flags/displaysync.flag");
     }
-    SERVICE_LOG_MIN("%d", displaySync);
+    SERVICE_LOG("%d", displaySync);
 
     return 0;
 }
@@ -560,7 +551,7 @@ static Result serviceSetDisplaySyncDocked() {
     else {
         remove("sdmc:/SaltySD/flags/displaysyncdocked.flag");
     }
-    SERVICE_LOG_MIN("%d", displaySyncDocked);
+    SERVICE_LOG("%d", displaySyncDocked);
 
     return 0;
 }
@@ -580,7 +571,7 @@ static Result serviceSetDisplaySyncRefreshRate60WhenOutOfFocus() {
     bool inDocked = (bool)(resp -> inDocked);
     if (inDocked) {
         displaySyncDockedOutOfFocus60 = (bool)(resp -> value);
-        SERVICE_LOG_MIN("Docked %d", displaySyncDockedOutOfFocus60);
+        SERVICE_LOG("Docked %d", displaySyncDockedOutOfFocus60);
     }
     else {
         displaySyncOutOfFocus60 = (bool)(resp -> value);
@@ -591,7 +582,7 @@ static Result serviceSetDisplaySyncRefreshRate60WhenOutOfFocus() {
         else {
             remove("sdmc:/SaltySD/flags/displaysync_outoffocus.flag");
         }
-        SERVICE_LOG_MIN("Handheld %d", displaySyncOutOfFocus60);
+        SERVICE_LOG("Handheld %d", displaySyncOutOfFocus60);
     }
 
     return 0;
@@ -1277,256 +1268,4 @@ void serviceThread()
     }
     
     SaltyNX_printf(APP_NAME ": done accepting service calls\n");
-}
-
-
-/* Dedicated endpoint for display-sync clients (f.e. NetherSX2) running next to
- * SaltyNX. The legacy SaltySD port accepts one client at a time and that slot is
- * used by SaltyNX Core while it bootstraps, so a second client can get a session
- * error there. This endpoint serves only the two commands such a client needs and
- * never touches the SD card tables, the process list or the refresh rate, so it is
- * safe to run on its own thread next to serviceThread().
- *
- * The loop below is written around what the kernel really does (Atmosphere
- * mesosphere, kernel/source/svc/kern_svc_port.cpp, kern_k_client_port.cpp,
- * kern_k_object_name.cpp) and not around guesswork:
- *
- *  - svcAcceptSession returns KernelError_NotFound (0xF201) whenever the port has
- *    no queued client session. That is the normal idle answer, not a failure: the
- *    port is healthy and a later client will be accepted normally.
- *  - A server port handle is a waitable object and becomes signalled as soon as a
- *    client session is queued for it (KServerPort::IsSignaled -> session list not
- *    empty). Waiting on it is what the legacy SaltySD port does too, and it keeps
- *    this thread quiet while nobody is connected.
- *  - svcManageNamedPort keeps the name in the global name list and the name holds
- *    a reference to the client port. Closing our server handle therefore does NOT
- *    remove the name: a re-registration only fails with KernelError_InvalidState
- *    (0xFA01) because the name is still there, while clients keep connecting to a
- *    port nobody accepts on. Never close this port at runtime.
- *  - A client connect can fail after the name lookup already succeeded, inside the
- *    client process' own resource limit (KernelError_OutOfResource / LimitReached,
- *    0x10801). Logging that on our side is impossible - it means the endpoint is
- *    visible and the client process is out of session slots, not that the port is
- *    missing.
- *
- * Do not connect to this port from inside the sysmodule (f.e. as a boot self-test):
- * the loopback client costs a session slot in the very same process and the kernel
- * does not hand it back the way an external client would.
- */
-void serviceThreadDisplaySync(void* portHandle)
-{
-    Handle port = (Handle)(uintptr_t)portHandle;
-    Result lastWaitRc = 0;
-    Result lastAcceptRc = 0;
-    Result lastSessionRc = 0;
-    u32 accepted = 0;
-    u32 served = 0;
-    u32 idleWaits = 0;
-    u32 truncatedLogged = 0;
-    u64 lastClientPid = 0;
-
-    if (port == INVALID_HANDLE)
-    {
-        SERVICE_LOG("display-sync thread started without a port, exiting");
-        return;
-    }
-
-    SERVICE_LOG("waiting for a client on port %s (handle 0x%x, SaltyNX %s)",
-                DISPLAY_SYNC_PORT_NAME, port, APP_VERSION);
-
-    while (1)
-    {
-        // Idle until a client session is queued. No polling, so a missing client
-        // cannot fill the log with NotFound lines (and cannot trigger a bogus
-        // recovery either).
-        Result ret = svcWaitSynchronizationSingle(port, DISPLAY_SYNC_WAIT_NS);
-
-        if (ret == 0xEA01) // KernelError_TimedOut
-        {
-            // While nobody has ever connected, prove once in a while that this
-            // thread is alive and that the port handle is still valid: a silent log
-            // would otherwise be indistinguishable from a dead worker thread.
-            if (accepted == 0 && ++idleWaits >= DISPLAY_SYNC_IDLE_WAITS)
-            {
-                idleWaits = 0;
-                SERVICE_LOG_MIN("no client on port %s yet (endpoint idle on handle 0x%x)",
-                            DISPLAY_SYNC_PORT_NAME, port);
-            }
-            continue;
-        }
-
-        idleWaits = 0;
-
-        if (R_FAILED(ret))
-        {
-            // A dead handle would spin here forever, so keep the retry slow and
-            // only report state changes.
-            if (ret != lastWaitRc)
-            {
-                SERVICE_LOG("wait on port %s failed: 0x%x", DISPLAY_SYNC_PORT_NAME, ret);
-                lastWaitRc = ret;
-            }
-            svcSleepThread(1000 * 1000 * 1000);
-            continue;
-        }
-
-        lastWaitRc = 0;
-
-        Handle session;
-        ret = svcAcceptSession(&session, port);
-        if (R_FAILED(ret))
-        {
-            // NotFound is the regular "queue is empty" answer: the wait can return
-            // right before another consumer takes the session, and the port may also
-            // be signalled for a session we already accepted. Never log it, never try
-            // to "fix" it - just go back to waiting.
-            if (ret == 0xF201)
-            {
-                svcSleepThread(1000 * 1000);
-                continue;
-            }
-
-            if (ret != lastAcceptRc)
-            {
-                SERVICE_LOG_MIN("accept failed: 0x%x", ret);
-                lastAcceptRc = ret;
-            }
-            svcSleepThread(10 * 1000 * 1000);
-            continue;
-        }
-
-        if (lastAcceptRc != 0)
-            SERVICE_LOG_MIN("accept works again after 0x%x", lastAcceptRc);
-        lastAcceptRc = 0;
-
-        accepted++;
-        if (accepted <= 3 || (accepted % 60) == 0)
-            SERVICE_LOG_MIN("client session #%u accepted", accepted);
-
-        Handle replySession = 0;
-        while (1)
-        {
-            int handle_index = 0;
-            ret = svcReplyAndReceive(&handle_index, &session, 1, replySession, UINT64_MAX);
-            if (R_FAILED(ret))
-            {
-                // ConnectionClosed (0xF601) ends every poll of the client, so report
-                // the first few sessions and any change - this must not write to the
-                // SD card once per second.
-                if (accepted <= 3 || ret != lastSessionRc)
-                    SERVICE_LOG_MIN("session finished: 0x%x", ret);
-                lastSessionRc = ret;
-                break;
-            }
-
-            IpcParsedCommand r = {0};
-            ipcParse(&r);
-
-            if (r.HasPid && (u64)r.Pid != lastClientPid)
-            {
-                lastClientPid = (u64)r.Pid;
-                displaySyncClientSeen = true;
-                SERVICE_LOG_MIN("client PID %lu connected (SaltyNX %s)", lastClientPid, APP_VERSION);
-            }
-
-            // The client builds its request at TLS+0x20, but the raw payload the
-            // kernel copies starts at TLS+0x14, so where the {magic, cmd} pair lands
-            // depends on how many words the client declared. Word 0 is therefore not
-            // a reliable place to look: a full 32 B request carries a stale
-            // SFCO_MAGIC there and the real pair at word 3, which is why those calls
-            // used to arrive as "unsupported command 0xffffffffffffffff" while the
-            // 16 B one worked by accident. Scan the whole window for the request
-            // magic instead.
-            //
-            // A 16 B request (NetherSX2 asks for the shared block that way) can end
-            // before the command id, and that size only ever means the shared block
-            // on this endpoint, so serve it rather than pushing the client back to
-            // the legacy port.
-            const u32* raw_words = (const u32*)r.Raw;
-            const u32 raw_bytes = (u32)r.RawSize;
-            const u32 raw_word_count = raw_bytes / sizeof(u32);
-            u64 command = UINT64_MAX;
-            u32 magic_index = 0;
-            bool magic_found = false;
-            bool id_found = false;
-
-            for (u32 i = 0; i < raw_word_count; i++)
-            {
-                if (raw_words[i] == SFCI_MAGIC)
-                {
-                    magic_found = true;
-                    magic_index = i;
-                    break;
-                }
-            }
-
-            if (!magic_found)
-            {
-                // The window does not always start where the client's payload does: the
-                // kernel prepends the descriptor words it needs, and with a 32 B payload
-                // the pair can land outside the copied region. This endpoint serves two
-                // commands with distinct ids, so look for those directly before giving
-                // up - a 32 B request from NetherSX2 is a rate query and would otherwise
-                // be answered with an error on every poll.
-                for (u32 i = 0; i + 1 < raw_word_count; i++)
-                {
-                    u64 word = 0;
-                    memcpy(&word, raw_words + i, sizeof(word));
-                    if (word == (u64)handleService_GetDisplayRefreshRate ||
-                        word == (u64)handleService_GetSharedMemoryHandle)
-                    {
-                        command = word;
-                        id_found = true;
-                        break;
-                    }
-                }
-            }
-            else if (raw_word_count < magic_index + 4)
-            {
-                // Only the magic made it in, the command id did not. One request is
-                // that short (NetherSX2 asks for the shared block with 16 B), and
-                // this endpoint has no other command that small.
-                command = handleService_GetSharedMemoryHandle;
-                if (!truncatedLogged)
-                {
-                    truncatedLogged = 1;
-                    SERVICE_LOG_MIN("client raw size %u B hides the command id, treating it as GetSharedMemoryHandle",
-                                raw_bytes);
-                }
-            }
-            else
-            {
-                command = *(const u64*)(raw_words + magic_index + 2);
-            }
-
-            switch (command) {
-                // Both replies are produced by handleServiceCmd, so this endpoint stays
-                // byte-for-byte identical with the legacy SaltySD one.
-                case handleService_GetDisplayRefreshRate:
-                case handleService_GetSharedMemoryHandle:
-                    handleServiceCmd((int)command);
-                    served++;
-                    if (served == 1)
-                        SERVICE_LOG_MIN("served first command 0x%lx", command);
-                    break;
-                default: {
-                    SERVICE_LOG_MIN("unsupported command 0x%lx (magic %s, raw %u B)",
-                                command, magic_found ? "found" : (id_found ? "found by id" : "missing"), raw_bytes);
-                    IpcCommand c;
-                    ipcInitialize(&c);
-                    struct {
-                        u64 magic;
-                        u64 result;
-                    } *raw = ipcPrepareHeader(&c, sizeof(*raw));
-                    raw->magic = SFCO_MAGIC;
-                    raw->result = 0xEE01;
-                    break;
-                }
-            }
-
-            replySession = session;
-        }
-
-        svcCloseHandle(session);
-    }
 }

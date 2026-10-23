@@ -511,39 +511,6 @@ struct dpaux_read {
     } DPCD;
 };
 
-// The PLLD drives the panel pixel clock, and the refresh rate is that clock divided
-// by (DSI_CLOCK_HZ / 60):
-//
-//   pixelClock = 9375 * (4096 * (2 * DIVN + 1) + SDM_DIN) / (4 * DIVM * (1 << DIVP))
-//
-// With DIVM = 1 and DIVP = 1 that is exactly
-//
-//   refresh * 3328 == 8192 * DIVN + 4096 + SDM_DIN
-//
-// so every integer rate has an exact solution: pick the nearest DIVN and give the
-// remainder to the sigma-delta modulator. One divider step is 8192/3328 = 2.46 Hz and
-// the modulator covers a full step (+-4096), so nothing in 45..60 Hz is out of reach -
-// 48 Hz even lands on SDM_DIN == 0, an exact integer divider.
-//
-// Up to 2.1.12 the request was truncated to a multiple of 5 and DIVN came from that:
-// a 48 Hz request became DIVN = 18 (45 Hz) with a +8192 correction, which is half a
-// step past the modulator's range, so the panel silently ran at the wrong rate.
-static bool plldSolveForRate(uint32_t rate, uint32_t* out_divn, int32_t* out_sdm) {
-    const int64_t needed = (int64_t)rate * 3328;
-    // round((needed - 4096) / 8192), which cancels down to needed / 8192
-    int64_t divn = needed / 8192;
-    if (divn < 1) divn = 1;
-    // Above 31 the divider needs DIVP = 0, which halves the resolution - not needed
-    // in the handheld range this function serves (45..60 Hz), so refuse instead of
-    // guessing.
-    if (divn > 31) return false;
-    const int64_t sdm = needed - (8192 * divn + 4096);
-    if (sdm <= -4096 || sdm > 4096) return false;
-    *out_divn = (uint32_t)divn;
-    *out_sdm = (int32_t)sdm;
-    return true;
-}
-
 bool setPLLDHandheldRefreshRate(uint32_t new_refreshRate) {
     if (!clkVirtAddr) return false;
     
@@ -583,28 +550,31 @@ bool setPLLDHandheldRefreshRate(uint32_t new_refreshRate) {
                 break;
             }
         }
-        // Nothing landed inside the window, so clamp to the slowest rate the panel
-        // allows rather than jumping to 60: at 43 FPS a 45 Hz panel is much closer
-        // than a 60 Hz one.
-        if (!skip) new_refreshRate = HandheldModeRefreshRateAllowed.min;
+        if (!skip) new_refreshRate = 60;
     }
     uint32_t pixelClock = (9375llu * ((4096 * ((2 * base.PLLD_DIVN) + 1)) + misc.PLLD_SDM_DIN)) / (4 * base.PLLD_DIVM * (1 << base.PLLD_DIVP));
-    uint16_t refreshRateNow = (pixelClock + (DSI_CLOCK_HZ / 120)) / (DSI_CLOCK_HZ / 60);
+    uint16_t refreshRateNow = pixelClock / (DSI_CLOCK_HZ / 60);
 
     if (refreshRateNow == new_refreshRate) {
         if (nx_fps) nx_fps->currentRefreshRate = new_refreshRate;
         return true;
     }
 
-    uint32_t DIVN = 0;
-    int32_t SDM_DIN = 0;
-    if (!plldSolveForRate(new_refreshRate, &DIVN, &SDM_DIN))
-        return false;
+    uint8_t base_refreshRate = new_refreshRate - (new_refreshRate % 5);
 
     base.PLLD_DIVM = 1;
     base.PLLD_DIVP = 1;
+    uint32_t DIVN = (4 * base_refreshRate) / 10;
+    if (DIVN > 31) {
+        base.PLLD_DIVP = 0;
+        DIVN /= 2;
+    }
+
     base.PLLD_DIVN = DIVN;
-    misc.PLLD_SDM_DIN = SDM_DIN;
+
+    uint64_t expected_pixel_clock = (DSI_CLOCK_HZ * new_refreshRate) / 60;
+
+    misc.PLLD_SDM_DIN = (int64_t)(((4ll * base.PLLD_DIVM * expected_pixel_clock) << base.PLLD_DIVP) / 9375) - (4096 * ((2 * base.PLLD_DIVN) + 1));
 
     memcpy((void*)(clkVirtAddr + 0xD0), &base, 4);
     memcpy((void*)(clkVirtAddr + 0xDC), &misc, 4);
@@ -945,7 +915,7 @@ extern "C" bool GetDisplayRefreshRate(uint32_t* out_refreshRate, bool internal) 
                 My math formula allows avoiding decimals whenever possible
             */
             uint32_t pixelClock = (9375llu * ((4096 * ((2 * temp.PLLD_DIVN) + 1)) + misc.PLLD_SDM_DIN)) / (4 * temp.PLLD_DIVM * (1 << temp.PLLD_DIVP));
-            value = (pixelClock + (DSI_CLOCK_HZ / 120)) / (DSI_CLOCK_HZ / 60);
+            value = pixelClock / (DSI_CLOCK_HZ / 60);
         }
         else return false;
     }

@@ -62,75 +62,27 @@ static bool hijack_bootstrap(Handle* debug, u64 pid, u64 tid, bool isA64)
     game_start_address = context.pc.x;
     uint64_t new_start = 0;
     if (isA64) {
-        u8* elf = NULL;
-        size_t saltynx_bootstrap_elf_size = 0;
-
-        // Prefer the copy taken at boot. The read below is the one that decides whether a
-        // game starts at all, and it is the one that fails on a card that has been idle
-        // since power-on - which is why the first title after a reboot used to need an
-        // emulator launched first to warm it up. At boot nothing is waiting on this, so it
-        // can be retried for as long as it takes; at hijack time a game is suspended at its
-        // entry point and every retry is visible to the user.
-        const bool fromCache = getBootstrappedElf(&elf, &saltynx_bootstrap_elf_size);
-        if (fromCache)
-            SaltyNX_printf(APP_NAME ": using the bootstrap copy from boot (%u B)\n",
-                           (unsigned)saltynx_bootstrap_elf_size);
-
         FILE* file = 0;
-        if (!elf) {
-            file = fopen("sdmc:/SaltySD/saltynx_bootstrap.elf", "rb");
-            if (!file) {
-                SaltyNX_printf(APP_NAME ": SaltySD/saltynx_bootstrap.elf not found, aborting...\n");
-                svcCloseHandle(*debug);
-                return false;
-            }
-            fseek(file, 0, 2);
-            const long elf_size_raw = ftell(file);
-            fseek(file, 0, 0);
-            // A negative or absurd size means the query failed, not that the file is odd.
-            // Reporting it is the point: this read decides whether a game starts, and
-            // until 2.1.44 the size was printed with %zu, which this printf does not
-            // support, so the one number that explains the failure never appeared.
-            if (elf_size_raw <= 0 || elf_size_raw > 0x100000) {
-                SaltyNX_printf(APP_NAME ": saltynx_bootstrap.elf size is %ld B (expected ~28 KB), "
-                               "aborting...\n", elf_size_raw);
-                fclose(file);
-                svcCloseHandle(*debug);
-                return false;
-            }
-            saltynx_bootstrap_elf_size = (size_t)elf_size_raw;
-            elf = malloc(saltynx_bootstrap_elf_size);
-            // fread with elements of one byte, so the return value is the byte count and
-            // not a boolean - which is the number worth reporting when this fails.
-            size_t got = 0;
-            if (elf) {
-                for (unsigned attempt = 0; attempt < 3; attempt++) {
-                    if (attempt) {
-                        clearerr(file);
-                        fseek(file, 0, 0);
-                        svcSleepThread(100ull * 1000 * 1000);
-                    }
-                    got = fread(elf, 1, saltynx_bootstrap_elf_size, file);
-                    if (got == saltynx_bootstrap_elf_size)
-                        break;
-                }
-            }
-            fclose(file);
-            if (!elf || got != saltynx_bootstrap_elf_size) {
-                SaltyNX_printf(APP_NAME ": couldn't read SaltySD/saltynx_bootstrap.elf after 3 attempts "
-                               "(%u B of %u requested), aborting...\n",
-                               (unsigned)got, (unsigned)saltynx_bootstrap_elf_size);
-                free(elf);
-                svcCloseHandle(*debug);
-                return false;
-            }
+        file = fopen("sdmc:/SaltySD/saltynx_bootstrap.elf", "rb");
+        if (!file) {
+            SaltyNX_printf(APP_NAME ": SaltySD/saltynx_bootstrap.elf not found, aborting...\n");
+            svcCloseHandle(*debug);
+            return false;
         }
-
-        ret = load_elf_debug(*debug, &new_start, elf, saltynx_bootstrap_elf_size);
-        // The cached copy outlives this launch - freeing it here would leave every later
-        // game reading a dangling pointer, which is worse than the read it replaced.
-        if (!fromCache)
+        fseek(file, 0, 2);
+        size_t saltynx_bootstrap_elf_size = ftell(file);
+        fseek(file, 0, 0);
+        u8* elf = malloc(saltynx_bootstrap_elf_size);
+        if (!elf || fread(elf, saltynx_bootstrap_elf_size, 1, file) != 1) {
+            SaltyNX_printf(APP_NAME ": couldn't read SaltySD/saltynx_bootstrap.elf, aborting...\n");
+            fclose(file);
             free(elf);
+            svcCloseHandle(*debug);
+            return false;
+        }
+        fclose(file);
+        ret = load_elf_debug(*debug, &new_start, elf, saltynx_bootstrap_elf_size);
+        free(elf);
     }
     else ret = load_elf32_debug(*debug, &new_start);
 
@@ -307,9 +259,6 @@ void hijack_pid(u64 pid)
     
     if (hijack_bootstrap(&debug, pid, threadid, isA64)) {
         lastAppPID = pid;
-        // A new app starts with no client seen, so the previous title's emulator cannot
-        // leave the cap suppressed for the next one.
-        displaySyncClientSeen = false;
         
         LoaderModuleInfo module_infos[2] = {0};
         s32 module_infos_count = 0;

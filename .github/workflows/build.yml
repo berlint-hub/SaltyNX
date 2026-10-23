@@ -1,11 +1,15 @@
 name: build
 
+# Builds the tree exactly as it stands and packages what devkitPro produces. There is
+# deliberately no verification of specific source strings here: the sources are the
+# upstream ones, unmodified, and a workflow that asserts on our own log lines would be
+# asserting on something this branch no longer contains.
+
 on:
   workflow_dispatch:
   push:
     branches:
       - 'arena/e0ad6872-saltynx'
-      - 'master'
 
 env:
   DEVKITPRO: /opt/devkitpro
@@ -28,22 +32,6 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Toolchain inventory
-        run: |
-          echo "DEVKITPRO=$DEVKITPRO"
-          ls "$DEVKITPRO"
-          for f in "$DEVKITPRO/libnx/switch_rules" \
-                   "$DEVKITPRO/libnx/switch.specs" \
-                   "$DEVKITPRO/libnx/switch.ld" \
-                   "$DEVKITPRO/libnx/lib/libnx.a" \
-                   "$DEVKITPRO/devkitA64/base_rules" \
-                   "$DEVKITPRO/libnx/switch.specs"; do
-            if [ -e "$f" ]; then echo "OK       $f"; else echo "::error::missing $f"; fi
-          done
-          for t in elf2nro elf2nso elf2kip nacptool npdmtool build_pfs0 make; do
-            command -v "$t" >/dev/null && echo "OK       tool $t" || echo "::error::missing tool $t"
-          done
-
       - name: Install devkitARM for the 32-bit payloads
         run: |
           if [ ! -f "$DEVKITPRO/devkitARM/base_rules" ]; then
@@ -53,17 +41,16 @@ jobs:
               || "$PM" -Sy --needed --noconfirm --disable-download-timeout devkitARM
           fi
           test -f "$DEVKITPRO/devkitARM/base_rules"
-          "$DEVKITPRO/devkitARM/bin/arm-none-eabi-gcc" --version | head -1
 
       - name: Build
         run: make -j2
 
-      - name: Verify
+      - name: Package
         run: |
           set -eu
           say() { echo "::notice::$1"; }
-          say "a64 gcc: $(aarch64-none-elf-gcc --version | head -1)"
-          say "arm gcc: $($DEVKITARM/bin/arm-none-eabi-gcc --version | head -1)"
+          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' version.mk)
+          test -n "$ver"
           for f in saltysd_bootstrap/saltynx_bootstrap.elf \
                    saltysd_bootstrap/saltynx_bootstrap32.elf \
                    saltysd_core/saltynx_core.elf \
@@ -73,232 +60,15 @@ jobs:
             [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
             say "$(stat -c%s "$f") B  $f"
           done
-          if grep -aq "NethFPS" saltysd_proc/saltynx_proc.elf; then
-            say "NethFPS endpoint string is present in saltynx_proc.elf"
-          else
-            echo "::error::NethFPS endpoint string is missing from saltynx_proc.elf"
-            exit 1
-          fi
-          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' version.mk)
           say "version.mk: $ver"
-          grep -q "\"version\": \"$ver\"" \
-            sdcard_out/atmosphere/contents/0000000000534C56/toolbox.json \
-            || { echo "::error::toolbox.json version does not match version.mk"; exit 1; }
-          say "toolbox.json version matches"
-          for marker in "bootstrap cached at boot" "could not cache the bootstrap at boot"; do
-            if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
-              say "proc marker present: $marker"
-            else
-              echo "::error::marker missing from saltynx_proc.elf: $marker"
-              exit 1
-            fi
-          done
-          # The unsupported conversion specifier that hid the byte count in the user's log.
-          if grep -aqF "B of %u requested" saltysd_proc/saltynx_proc.elf; then
-            say "proc marker present: B of %u requested"
-          else
-            echo "::error::byte-count message missing from saltynx_proc.elf"
-            exit 1
-          fi
-          # A warning, not a failure: library code may legitimately carry the literal.
-          if grep -aqF "%zu" saltysd_proc/saltynx_proc.elf; then
-            say "note: saltynx_proc.elf still contains a literal %zu somewhere"
-          else
-            say "no %zu left in saltynx_proc.elf"
-          fi
-          for marker in "display-sync endpoint ready" "waiting for a client on port" \
-                        "no client on port" "client PID" "session #" \
-                        "hides the command id" \
-                        "target held" \
-                        "integer refresh rates" \
-                        "which the app held before" \
-                        "never goes below" \
-                        "logging is opt-in" \
-                        "sweep: " \
-                        "fine sync enabled" \
-                        "fine: block=" \
-                        "plugin=" \
-                        "cap=" \
-                        "the Core's last word" \
-                        "no sdmc:/SaltySD/saltynx_core.log" \
-                        "FPSLocker target for this session" \
-                        "never ran in this process" \
-                        "is MISSING - games will start without SaltyNX" \
-                        "saltynx_core.elf" \
-                        "could not read %u B from the SD card" \
-                        "saltynx_bootstrap.elf after 3 attempts"; do
-            if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
-              say "marker present: $marker"
-            else
-              echo "::error::marker missing from saltynx_proc.elf: $marker"
-              exit 1
-            fi
-          done
-          # Removed in 2.1.39: it connected to named ports from inside every hijacked
-          # game. Nothing in a shipped Core should do that, so assert it is gone rather
-          # than trusting that nobody puts it back.
-          for marker in "probe[" "after-deinit" "nethfps=0x"; do
-            if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
-              echo "::error::removed diagnostic is back in saltynx_core.elf: $marker"
-              exit 1
-            else
-              say "core marker absent (expected): $marker"
-            fi
-          done
-          # The bootstrap is the file that decides whether a game starts at all: it runs
-          # at the game's own entry point and exits the process if it cannot reach the
-          # sysmodule or load the Core. Both of its give-up paths must stay visible.
-          for marker in "did not answer in 10 s"; do
-            if grep -aqF "$marker" saltysd_bootstrap/saltynx_bootstrap.elf; then
-              say "bootstrap marker present: $marker"
-            else
-              echo "::error::marker missing from saltynx_bootstrap.elf: $marker"
-              exit 1
-            fi
-          done
-          for marker in "session limit" "no executable main region found" "measuring frames" \
-                        "disabled by nofps.flag"; do
-            if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
-              say "core marker present: $marker"
-            else
-              echo "::error::marker missing from saltynx_core.elf: $marker"
-              exit 1
-            fi
-          done
-          nsp=sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp
-          if grep -aq "NethFPS" "$nsp"; then
-            say "NethFPS endpoint string is present in exefs.nsp"
-          else
-            say "NethFPS not found literally in exefs.nsp (compressed NSO inside)"
-          fi
-          say "exefs.nsp size $(stat -c%s "$nsp") B sha256 $(sha256sum "$nsp" | cut -d' ' -f1)"
-
-      - name: Package
-        run: |
-          set -eu
-          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' version.mk)
-          test -n "$ver"
           mkdir -p artifact
           (cd sdcard_out && zip -qr "../artifact/SaltyNX-${ver}-sdcard.zip" .)
           cp sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp "artifact/exefs-${ver}.nsp"
-          cp -r sdcard_debug artifact/debug
+          sha256sum artifact/*
           ls -la artifact
-          sha256sum artifact/*.nsp artifact/*.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: SaltyNX-build
           path: artifact/
-          if-no-files-found: error
-
-  # Differential baseline. Builds the pristine upstream tree this branch was started
-  # from, with the same toolchain, in the same run, and ships it as its own artifact.
-  #
-  # The point is to settle "is this our change or something else" with a file instead of
-  # an argument: flash the upstream artifact, reproduce, and the answer is whichever of
-  # the two builds behaves. a3fee3f was verified byte for byte against
-  # masagrator/SaltyNX master - 231 files, no differences - so this job builds what a
-  # stock install of the same release would contain, minus our commits.
-  upstream:
-    runs-on: ubuntu-latest
-    container:
-      image: docker.io/devkitpro/devkita64:latest
-      options: --user root
-    env:
-      BASELINE: a3fee3fbe05c494d5246f9fe61066c429c09528a
-      BASELINE_VERSION: "2.1.3"
-    steps:
-      - name: Tools the image may lack
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq || echo "::warning::apt-get update failed"
-          apt-get install -y --no-install-recommends \
-            make git ca-certificates curl zip || echo "::warning::some apt packages failed"
-
-      # Full history, because the baseline is an older commit rather than the tip.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install devkitARM for the 32-bit payloads
-        run: |
-          if [ ! -f "$DEVKITPRO/devkitARM/base_rules" ]; then
-            PM=$(command -v dkp-pacman || command -v pacman)
-            echo "using $PM"
-            "$PM" -S --needed --noconfirm --disable-download-timeout devkitARM \
-              || "$PM" -Sy --needed --noconfirm --disable-download-timeout devkitARM
-          fi
-          test -f "$DEVKITPRO/devkitARM/base_rules"
-
-      - name: Extract the upstream tree
-        run: |
-          set -eu
-          say() { echo "::notice::$1"; }
-          fail() { echo "::error::$1"; exit 1; }
-          mkdir -p upstream
-
-          # Preferred path: the baseline is an ancestor of this branch, so a full
-          # checkout already has it and nothing needs downloading.
-          if git cat-file -e "$BASELINE^{commit}" 2>/dev/null; then
-            git archive --format=tar -o /tmp/baseline.tar "$BASELINE" \
-              || fail "git archive $BASELINE failed"
-          else
-            # Fallback, so the job does not depend on how the ref was fetched: fetch the
-            # same tree from the forge and check it is the version expected.
-            say "$BASELINE not present in the checkout, downloading the upstream tarball"
-            curl -fsSL -o /tmp/baseline.tgz \
-              "https://codeload.github.com/masagrator/SaltyNX/tar.gz/refs/heads/master" \
-              || fail "could not download the upstream tarball"
-            tar -xzOf /tmp/baseline.tgz --wildcards '*/version.mk' > /tmp/upver.mk \
-              || fail "could not read version.mk from the tarball"
-            [ "$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' /tmp/upver.mk)" = "$BASELINE_VERSION" ] \
-              || fail "upstream master is no longer $BASELINE_VERSION; pin the baseline explicitly"
-            tar -xzf /tmp/baseline.tgz -C upstream --strip-components=1 \
-              || fail "could not extract the upstream tarball"
-          fi
-
-          if [ -f /tmp/baseline.tar ]; then
-            tar -xf /tmp/baseline.tar -C upstream || fail "could not extract $BASELINE"
-          fi
-
-          [ -f upstream/Makefile ] || fail "baseline tree has no Makefile"
-          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)
-          say "baseline version: $ver"
-
-          # Anything of ours that leaked into the baseline would make the comparison
-          # meaningless, so say so rather than discovering it after a flash.
-          if [ -e upstream/saltysd_proc/source/display_sync.h ]; then
-            fail "baseline tree contains fork-only files"
-          fi
-          say "baseline tree carries no fork-only sources ($(find upstream -type f | wc -l) files)"
-
-      - name: Build
-        run: make -C upstream -j2
-
-      - name: Verify and package
-        run: |
-          set -eu
-          say() { echo "::notice::$1"; }
-          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)
-          for f in upstream/saltysd_bootstrap/saltynx_bootstrap.elf \
-                   upstream/saltysd_bootstrap/saltynx_bootstrap32.elf \
-                   upstream/saltysd_core/saltynx_core.elf \
-                   upstream/saltysd_core/saltynx_core32.elf \
-                   upstream/saltysd_proc/saltynx_proc.nsp \
-                   upstream/sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp; do
-            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
-            say "$(stat -c%s "$f") B  $f"
-          done
-          mkdir -p artifact-upstream
-          (cd upstream/sdcard_out && zip -qr ../../artifact-upstream/SaltyNX-upstream-${ver}-sdcard.zip .)
-          cp upstream/sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp \
-             "artifact-upstream/exefs-upstream-${ver}.nsp"
-          say "baseline artifact: SaltyNX-upstream-${ver}-sdcard.zip"
-          ls -la artifact-upstream
-          sha256sum artifact-upstream/*
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SaltyNX-upstream-baseline
-          path: artifact-upstream/
           if-no-files-found: error
