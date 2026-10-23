@@ -98,6 +98,8 @@ jobs:
                         "fine: block=" \
                         "plugin=" \
                         "cap=" \
+                        "the Core's last word" \
+                        "no sdmc:/SaltySD/saltynx_core.log" \
                         "FPSLocker target for this session" \
                         "never ran in this process" \
                         "is MISSING - games will start without SaltyNX" \

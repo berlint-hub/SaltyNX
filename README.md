@@ -303,6 +303,36 @@ The remaining three seconds are `FINE_REJECT_MS` and nothing else. That is the d
 
 **One thing still cannot be tracked, and it is worth being clear about.** Under vsync the panel paces the app, so an app held at 47 measures 47 whether it could do 50 or not - the signal that would justify a rise does not exist in the measurement. Rising therefore cannot be inferred, only tested: after eight seconds of the measurement agreeing with the panel, the loop raises it one hertz for six seconds and watches. If the app follows, the panel stays; if not, that rate is parked. Eight seconds instead of fifteen is the only change here, and it makes the discovery faster without changing how often a wrong guess is retried.
 
+### Why NX-FPS fails to start in a native game: the busy port
+
+The Core opens a session on the legacy `SaltySD` port in the first moments of a game's life. It uses that session to fetch the shared memory handle and to create the NX-FPS block - the whole instrument, in one window of a few milliseconds right after the process is hijacked.
+
+That port had **one** client slot. `svcManageNamedPort(..., 1)`.
+
+So if anything else held the slot at that moment, the Core's `SaltySD_Init()` was refused, it took its fail path, and NX-FPS did not exist for that launch. Nothing measured frames, fine mode had nothing to follow, and FPSLocker reported that the plugin was not running. The cause was a busy slot microseconds earlier, and none of it was visible.
+
+What holds the slot is ordinary use: the FPSLocker overlay connects to read the same block it is about to tell you is missing. Launching a game with the overlay open is the natural thing to do when checking whether the plugin works - which is exactly how this surfaced.
+
+This fork already knew about the problem, and the note is still in `service.c` above the display-sync endpoint - it exists *because* the legacy port only takes one client. Raising the count is the fix that note implies:
+
+| | before | now |
+|---|---|---|
+| `SaltySD` client slots | 1 | 4 |
+| second client | connection refused | queued, served in milliseconds |
+| Core init when the overlay is open | fails, no NX-FPS | waits, then succeeds |
+
+The accept loop still handles one session at a time, so this changes queueing, not concurrency: a client that connects while another is mid-request now waits for that request instead of being turned away. Four slots also match the display-sync endpoint, which was created with exactly this reasoning.
+
+### When it is not the port
+
+If the block is still missing after that, the Core itself has already said why. Every stage it reaches and every failure it takes are appended to `sdmc:/SaltySD/saltynx_core.log`, and since 2.1.41 the sysmodule repeats the last of those lines into its own log, once per app, the first time it notices the block is absent:
+
+```
+SaltyNX: fine: no NX-FPS block - the Core's last word was: NX-FPS: ret: 0xFFE
+```
+
+`ret: 0` means the block was created and the sysmodule should have found it; a non-zero `ret` is the kernel result the Core got when it asked for room; no line at all means the Core never reached `NX_FPS()`, and `failed with retcode` is the one that says it took the fail path.
+
 ### "NX-FPS is not running" has two different causes
 
 FPSLocker's message looks the same for two faults that have nothing in common, and the difference decides who can fix it.

@@ -1,4 +1,5 @@
 #include <switch.h>
+#include <string.h>
 #include "ipc.h"
 #include "display_refresh_rate.h"
 
@@ -204,6 +205,65 @@ __attribute__((noinline)) static Result isApplicationOutOfFocus(bool* outOfFocus
     *outOfFocus = isOut;
     isOutOfFocus = isOut;
     return 0;
+}
+
+// When the NX-FPS block is missing, this sysmodule has nothing to say: it looks in its own
+// shared memory for a magic word that the injected Core writes, and it is not there. The
+// Core, however, already explained itself - every stage it reaches and every failure it
+// hits go into sdmc:/SaltySD/saltynx_core.log, if log.flag was on when the game started.
+//
+// Asking a user to go and find a second file is how a diagnosable fault turns into an
+// unexplained one, so the last thing the Core said about itself is repeated here. A single
+// line, once per app, and only when a block is actually missing - which is exactly the case
+// where it is the only useful information available.
+static void reportCoreLastWords() {
+    FILE* f = fopen("sdmc:/SaltySD/saltynx_core.log", "rb");
+    if (!f) {
+        SaltyNX_printf(APP_NAME ": fine: no NX-FPS block, and no sdmc:/SaltySD/saltynx_core.log - "
+                       "the Core never ran for this app, or log.flag was off when it started\n");
+        return;
+    }
+    fseek(f, 0, 2);
+    const long size = ftell(f);
+    const long start = size > 4096 ? size - 4096 : 0;
+    fseek(f, start, 0);
+    static char buf[4097];
+    const size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    if (!got) {
+        SaltyNX_printf(APP_NAME ": fine: no NX-FPS block, and sdmc:/SaltySD/saltynx_core.log is empty\n");
+        return;
+    }
+    // The most advanced stage is the useful one, so take the last matching line in the
+    // tail rather than the first - "NX-FPS: alive" followed by "NX-FPS: ret: 0xFFE" means
+    // something very different from "alive" on its own.
+    static const char* const marks[] = { "NX-FPS:", "failed with retcode" };
+    const char* best = NULL;
+    for (size_t k = 0; k < sizeof(marks) / sizeof(marks[0]); k++) {
+        const char* p = buf;
+        while ((p = strstr(p, marks[k])) != NULL) {
+            const char* lineStart = p;
+            while (lineStart > buf && lineStart[-1] != '\n')
+                lineStart--;
+            if (!best || lineStart > best)
+                best = lineStart;
+            p += 1;
+        }
+    }
+    if (!best) {
+        SaltyNX_printf(APP_NAME ": fine: no NX-FPS block, and the Core log names no stage "
+                       "(last 4 KB carry no NX-FPS line)\n");
+        return;
+    }
+    char line[200];
+    size_t n = 0;
+    while (best[n] && best[n] != '\n' && best[n] != '\r' && n < sizeof(line) - 1) {
+        line[n] = best[n];
+        n++;
+    }
+    line[n] = '\0';
+    SaltyNX_printf(APP_NAME ": fine: no NX-FPS block - the Core's last word was: %s\n", line);
 }
 
 void updateNxFpsPointer() {
@@ -550,6 +610,7 @@ static uint32_t fineTarget = 0;
 // above the panel is requiring proof of the thing being fixed.
 static bool fineTargetIsMultiple = false;
 static bool capSuppressedLogged = false;
+static bool coreLogReported = false;
 // When the panel was last written. FINE_CHANGE_MIN_MS is measured from here, so the
 // limit survives a target that changes twice in quick succession.
 static u64 fineLastApplyTick = 0;
@@ -894,6 +955,7 @@ void cleanAppData() {
     fineTarget = 0;
     fineTargetIsMultiple = false;
     capSuppressedLogged = false;
+    coreLogReported = false;
     fineLastApplyTick = 0;
     fineEverMeasured = false;
     probeFailCount = 0;
@@ -1016,6 +1078,10 @@ void updateRefreshRateForApp() {
                 // never initialised at all. Those are different faults with different
                 // owners, and until now both looked like "the plugin is not running".
                 const uint32_t plugin = (nx_fps && nx_fps->pluginActive) ? 1u : 0u;
+                if (!nx_fps && !coreLogReported) {
+                    coreLogReported = true;
+                    reportCoreLastWords();
+                }
                 SaltyNX_printf(APP_NAME ": fine: block=%s plugin=%u FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u cap=%u\n",
                                nx_fps ? "found" : "missing",
                                plugin,
@@ -1438,7 +1504,22 @@ void Initialize() {
 
     // Start our port
     // For some reason, we only have one session maximum (0 reslimit handle related?)	
-    svcManageNamedPort(&saltyport, "SaltySD", 1);
+    // Four client slots, not one, and this is a real fix rather than tidying.
+    //
+    // With a single slot the port refuses a second client outright, and the client that
+    // matters is the injected Core: it opens a session during the first moments of a
+    // game's life to fetch the shared memory handle and to create the NX-FPS block. If
+    // anything else holds that one slot at that moment - the FPSLocker overlay, a
+    // homebrew, a previous session that has not been reaped - the Core's SaltySD_Init()
+    // fails, it takes the fail path, and NX-FPS never exists for that launch. The panel
+    // then has nothing to measure and an overlay says the plugin is not running, with no
+    // hint that the cause was a busy slot microseconds earlier.
+    //
+    // Four slots turn a hard failure into a short wait: the connect succeeds and the
+    // request is served as soon as serviceThread() is free, which for every client here
+    // is milliseconds. The accept loop still handles one session at a time, so this
+    // changes queueing, not concurrency.
+    svcManageNamedPort(&saltyport, "SaltySD", 4);
     // Second port for display-sync clients living inside the hijacked process. SaltySD
     // accepts one client at a time and Core uses that slot while it bootstraps, so an
     // app running in the same process can get OutOfResource there.
