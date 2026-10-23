@@ -95,7 +95,10 @@ jobs:
                         "logging is opt-in" \
                         "sweep: " \
                         "fine sync enabled" \
-                        "fine: block="; do
+                        "fine: block=" \
+                        "plugin=" \
+                        "never ran in this process" \
+                        "saltynx_core.elf is MISSING"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else
@@ -103,7 +106,18 @@ jobs:
               exit 1
             fi
           done
-          for marker in "probe[" "after-deinit" "session limit"; do
+          # Removed in 2.1.39: it connected to named ports from inside every hijacked
+          # game. Nothing in a shipped Core should do that, so assert it is gone rather
+          # than trusting that nobody puts it back.
+          for marker in "probe[" "after-deinit" "nethfps=0x"; do
+            if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
+              echo "::error::removed diagnostic is back in saltynx_core.elf: $marker"
+              exit 1
+            else
+              say "core marker absent (expected): $marker"
+            fi
+          done
+          for marker in "session limit"; do
             if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
               say "core marker present: $marker"
             else
