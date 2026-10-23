@@ -916,10 +916,13 @@ void updateRefreshRateForApp() {
                 else if (!fineNoDataLogged && nowFine - fineNoDataSince >= 30000ULL * SV_TICKS_PER_MS) {
                     fineNoDataLogged = true;
                     const uint32_t avg_x100 = (uint32_t)(nx_fps->FPSavg * 100.0f);
-                    SaltyNX_printf(APP_NAME ": fine: no measurement after 30 s (FPS=%u FPSavg=%u.%02u) - "
-                                   "nothing is publishing FPSavg for this app, "
-                                   "falling back to the client target\n",
-                                   (u32)nx_fps->FPS, avg_x100 / 100, avg_x100 % 100);
+                    SaltyNX_printf(APP_NAME ": fine: no measurement after 30 s (FPS=%u FPSavg=%u.%02u plugin=%u) - "
+                                   "%s, falling back to the client target\n",
+                                   (u32)nx_fps->FPS, avg_x100 / 100, avg_x100 % 100,
+                                   nx_fps->pluginActive ? 1u : 0u,
+                                   nx_fps->pluginActive
+                                       ? "NX-FPS is active but has not produced a usable average"
+                                       : "NX-FPS never ran in this process, so nothing measures its frames");
                 }
             }
             if (nowFine - lastFineLog >= 30000ULL * SV_TICKS_PER_MS) {
@@ -927,8 +930,16 @@ void updateRefreshRateForApp() {
                 const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
                 const uint32_t meas_x100 = (uint32_t)(fineAvg * 100.0f);
                 const uint32_t peak_x10 = (uint32_t)(finePeak * 10.0f);
-                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u\n",
+                // pluginActive is the field FPSLocker gates its whole menu on, and it is
+                // set by NX-FPS in PostFrame - not by this sysmodule, and not by any
+                // client. A block that exists with plugin=0 means the Core initialised
+                // and NX-FPS's present hook never fired; a missing block means the Core
+                // never initialised at all. Those are different faults with different
+                // owners, and until now both looked like "the plugin is not running".
+                const uint32_t plugin = (nx_fps && nx_fps->pluginActive) ? 1u : 0u;
+                SaltyNX_printf(APP_NAME ": fine: block=%s plugin=%u FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u\n",
                                nx_fps ? "found" : "missing",
+                               plugin,
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
                                meas_x100 / 100, meas_x100 % 100,

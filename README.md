@@ -303,6 +303,24 @@ The remaining three seconds are `FINE_REJECT_MS` and nothing else. That is the d
 
 **One thing still cannot be tracked, and it is worth being clear about.** Under vsync the panel paces the app, so an app held at 47 measures 47 whether it could do 50 or not - the signal that would justify a rise does not exist in the measurement. Rising therefore cannot be inferred, only tested: after eight seconds of the measurement agreeing with the panel, the loop raises it one hertz for six seconds and watches. If the app follows, the panel stays; if not, that rate is parked. Eight seconds instead of fifteen is the only change here, and it makes the discovery faster without changing how often a wrong guess is retried.
 
+### "NX-FPS is not running" has two different causes
+
+FPSLocker's message looks the same for two faults that have nothing in common, and the difference decides who can fix it.
+
+`pluginActive` is the field the overlay gates its entire menu on - no plugin, no buffer selector, no target list. It is set in exactly one place, `NX-FPS-Common.hpp` inside `PostFrame()`, which runs when NX-FPS's patched present path fires. It is not set by the sysmodule and not by any client.
+
+So:
+
+| what the status line says | what actually happened | whose problem |
+|---|---|---|
+| `block=missing` | the Core never initialised in that process - no `0x465053` anywhere in shared memory | install/load: `saltynx_core.elf`, `saltynx_bootstrap.elf` |
+| `block=found plugin=0` | the Core initialised and NX-FPS's present hook never fired for this title | the game's rendering path, i.e. nothing to fix here |
+| `block=found plugin=1` | working | - |
+
+Since 2.1.39 the 30 second status line carries `plugin=`, and the 30 second "no measurement" line says which of the two it is in words. Before that both read as "the plugin is not running".
+
+Worth knowing while comparing titles: NetherSX2 reports the first state as *working*. It publishes into the same block, but it finds the block rather than creating it - the Core still has to run and build it. So an emulator that measures correctly proves the Core loaded, and says nothing about whether NX-FPS's own present hook fires.
+
 ### Who does what: SaltyNX, the Core, and FPSLocker
 
 These three are constantly mistaken for alternatives. They are a stack, and the confusion costs people a whole evening every time, because the missing piece is the one nobody installs separately.
