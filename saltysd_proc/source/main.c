@@ -428,16 +428,35 @@ static void loadFineSyncFlag() {
 // refused, and the rest are averaged. Ten refusals in a row is not noise any
 // more, that is a different app or a different scene, so the average restarts
 // from the new value.
-#define FINE_SAMPLE_MS   900ULL
-#define FINE_SMOOTHING   0.35f
+// How often the published value is read. This used to be 900 ms, which was chosen to
+// match a client that publishes once a second - but it meant a value that arrived just
+// after a sample waited up to 900 ms to be seen, on top of the client's own delay.
+// Reading four times a second and letting the time constant below do the smoothing is
+// the same filter with less latency, because a coefficient derived from the interval
+// makes the wall-clock behaviour independent of the sampling rate. Sampling faster than
+// the client publishes adds no information and no noise: the same value read twice
+// simply moves the average by the smaller step it now deserves.
+#define FINE_SAMPLE_MS     250ULL
+// Time constant of the averaging filter. 900 ms against 2571 ms is the 0.35 coefficient
+// this filter has always used; deriving the coefficient from the measured interval
+// instead of hard-coding it is what lets the input rate change without the smoothing
+// changing with it. A linear ramp stands in for 1 - exp(-dt/tau): every interval here is
+// far shorter than the time constant, so the two agree to within a rounding error, and
+// it costs no libm call.
+#define FINE_TAU_MS      2571ULL
 #define FINE_REJECT_HZ   2.0f
-#define FINE_REJECT_MAX  10u
+// How long a jump has to persist before it is believed, and how long unusable samples are
+// tolerated. Both used to be counted in samples, which silently tied them to the sampling
+// rate; they are durations now.
+#define FINE_REJECT_MS   9000ULL
+#define FINE_INVALID_MS  9000ULL
 
 static float fineAvg = 0.0f;
 static bool fineAvgValid = false;
 static u64 fineSampleTick = 0;
-static uint32_t fineRejects = 0;
-static uint32_t fineInvalid = 0;
+static u64 fineRejectSince = 0;
+static u64 fineInvalidSince = 0;
+static float fineLastRaw = 0.0f;
 // Highest smoothed value this app has shown. It is the only evidence that a higher
 // rate is worth testing: while the panel holds the app down, the app never measures
 // above the panel, so "the app is capable of more" cannot be observed at the moment
@@ -457,16 +476,17 @@ static bool fineClimbing = false;
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
         fineAvgValid = false;
-        fineRejects = 0;
-        fineInvalid = 0;
+        fineRejectSince = 0;
+        fineInvalidSince = 0;
         return;
     }
     const u64 now = svcGetSystemTick();
-    if (fineSampleTick && now - fineSampleTick < FINE_SAMPLE_MS * SV_TICKS_PER_MS)
+    const float avg = nx_fps->FPSavg;
+    const u64 sinceMs = fineSampleTick ? (now - fineSampleTick) / SV_TICKS_PER_MS : FINE_SAMPLE_MS;
+    if (fineSampleTick && sinceMs < FINE_SAMPLE_MS)
         return;
     fineSampleTick = now;
-
-    const float avg = nx_fps->FPSavg;
+    fineLastRaw = avg;
     // FPSavg is 255 in NX-FPS before the first frame, 0 before a client
     // publishes anything, and lands in 14..29 for a second or two after a
     // multi-second hitch - the client measures frame intervals, and one stall
@@ -476,31 +496,42 @@ static void fineSampleMeasurement() {
     // included, and climb to 55. So a single unusable sample is skipped and
     // only a sustained absence of any usable value gives up the average.
     if (!(avg >= 30.0f && avg <= 240.0f)) {
-        if (fineAvgValid && ++fineInvalid < FINE_REJECT_MAX)
-            return;
+        if (fineAvgValid) {
+            if (fineInvalidSince == 0) {
+                fineInvalidSince = now;
+                return;
+            }
+            if (now - fineInvalidSince < FINE_INVALID_MS * SV_TICKS_PER_MS)
+                return;
+        }
         fineAvgValid = false;
         fineAvg = 0.0f;
-        fineRejects = 0;
-        fineInvalid = 0;
+        fineRejectSince = 0;
+        fineInvalidSince = 0;
         return;
     }
-    fineInvalid = 0;
+    fineInvalidSince = 0;
     fineEverMeasured = true;
     if (!fineAvgValid) {
         fineAvg = avg;
         fineAvgValid = true;
-        fineRejects = 0;
+        fineRejectSince = 0;
         return;
     }
     if (avg < fineAvg - FINE_REJECT_HZ || avg > fineAvg + FINE_REJECT_HZ) {
-        if (++fineRejects >= FINE_REJECT_MAX) {
+        if (fineRejectSince == 0)
+            fineRejectSince = now;
+        else if (now - fineRejectSince >= FINE_REJECT_MS * SV_TICKS_PER_MS) {
             fineAvg = avg;
-            fineRejects = 0;
+            fineRejectSince = 0;
         }
         return;
     }
-    fineRejects = 0;
-    fineAvg += (avg - fineAvg) * FINE_SMOOTHING;
+    fineRejectSince = 0;
+    float alpha = (float)sinceMs / (float)FINE_TAU_MS;
+    if (alpha > 1.0f) alpha = 1.0f;
+    if (alpha < 0.05f) alpha = 0.05f;
+    fineAvg += (avg - fineAvg) * alpha;
     if (fineAvg > finePeak)
         finePeak = fineAvg;
 }
@@ -627,6 +658,9 @@ void cleanAppData() {
     fineEverMeasured = false;
     probeFailCount = 0;
     fineClimbing = false;
+    fineRejectSince = 0;
+    fineInvalidSince = 0;
+    fineLastRaw = 0.0f;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;

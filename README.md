@@ -269,6 +269,26 @@ The floor also earns a test of its own. 45 Hz is a clamp, not a content-derived 
 
 The same simulation with these changes: 9 switches and settled at 50 Hz.
 
+### How fast the loop reacts
+
+Three delays sit in series, and it is worth knowing which one is which:
+
+| stage | period | where |
+|---|---|---|
+| client publishes `FPSavg` | 1 s | `saltysd_display_sync_poll()`, `s_next_query_tick` |
+| sysmodule reads it | was 900 ms, now 250 ms | `FINE_SAMPLE_MS` |
+| panel is moved | 4 s hold, 1.5 s for a large drop | `REFRESH_RATE_FINE_MS` |
+
+The 900 ms could only ever lose time. It was picked to match a client that publishes once a second, but the two clocks are not in step: a value that arrived just after a sample waited almost a full second to be read, on top of the client's own delay. Reading four times a second removes up to 650 ms of that, and a coefficient derived from the measured interval keeps the wall-clock smoothing identical - the same filter, sampled more finely.
+
+Measured on a step from 50 to 45 fps: the average reaches halfway 2.54 s after the step instead of 2.72 s, and closes 90% of it in 7.22 s instead of 7.27 s. The smoothing did not get faster; the reporting did.
+
+The sampling interval, the jump-rejection hold and the unusable-sample grace are all durations now rather than sample counts. That matters because they were counts: ten samples was ten seconds at 900 ms and would have been two and a half at 250 ms, so raising the rate alone would have quietly made the filter three times twitchier.
+
+The 4 s hold is deliberately unchanged. The deadband decides *whether* the panel should move; the hold only decides *when*, and it is what stops a single noisy second from moving the panel. A one hertz climb does not pay it at all - fine probes hold for zero milliseconds - so the recovery path is not affected.
+
+The remaining second belongs to the client. Its ring holds sixteen present intervals, which is 320 ms at 50 Hz, so it measures three times more than it publishes and throws the rest away. `nethersx2-fpsavg-v3-handoff.md` drops that to 250 ms; the sysmodule follows whatever cadence arrives, so it takes effect without a matching release here.
+
 Fine mode also stopped jumping. On 2.1.29 a single measurement took the panel from 45 to 60 Hz after 1.5 seconds, with the value still reading 45.09 fourteen seconds earlier - a spurious burst of presents, fifteen hertz of mode switch. Rises now always take the full four second hold, and move at most two hertz per step, so a wrong reading costs one step and falls straight back while a real scene change still arrives, one hold at a time. Drops keep their short hold: falling is cheap to be wrong about, and the panel below the app is the judder this whole path exists to remove.
 
 The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end.
