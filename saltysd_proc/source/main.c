@@ -481,13 +481,15 @@ static void loadFineSyncFlag() {
 // There is deliberately no smoothing filter on the measurement any more, and removing it
 // was the largest single improvement in responsiveness this loop has had.
 //
-// FPSavg is not a raw frame counter. It is already an average over the publisher's own
-// window - a second for NetherSX2, similar for NX-FPS - so the 2140 ms time constant was
-// a second averaging stage on top of a value that had already been averaged for a
-// second. It existed to stop one bad sample from reaching the decision, and the jump
-// rejection below does that earlier and better: anything more than two hertz from the
-// current value is refused until it has persisted. The extra stage bought no protection
-// and cost two seconds of every response.
+// FPSavg is not a raw frame counter. A native game gets NX-FPS's ten frame exponential
+// average, republished on every frame - about 167 ms of window at 60 fps. NetherSX2
+// publishes its own present-window average once a second. Either way the 2140 ms time
+// constant was a second averaging stage on top of a value that was already averaged, and
+// on the fast publisher it was ten times the window it was trying to smooth. It existed
+// to stop one bad sample from reaching the decision, and the jump rejection below does
+// that earlier and better: anything more than two hertz from the current value is
+// refused until it has persisted. The extra stage bought no protection and cost two
+// seconds of every response.
 //
 // The filtering now happens where it belongs, in fineMeasuredTarget, which decides
 // whether a difference is real. A decision is a much better place to be conservative
