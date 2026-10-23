@@ -319,6 +319,10 @@ static u64 pendingRefreshRequired = 0;
 // The requested rate therefore keeps a deadband of its own: it only moves when the
 // measurement has clearly left it, not when it grazes the boundary.
 #define FINE_TARGET_HYST     0.55f
+// Falling is the more dangerous direction: the published value sits a little under
+// the panel rate whenever the app is being throttled rather than free-running, so a
+// whole hertz of drift downwards is normal. Only follow a fall that is clear of that.
+#define FINE_TARGET_FALL     1.20f
 
 static bool probeArmed = false;      // last applied change went below the demonstrated max
 static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
@@ -492,10 +496,16 @@ static uint32_t fineMeasuredTarget() {
     // asked for. Without this a smoothed 48.9 rounds to 49, drops the panel, and the
     // next sample rounds back to 50 - a mode switch every few seconds that looks
     // exactly like the judder it was supposed to remove.
-    if (fineTarget && target != fineTarget &&
-        avg > (float)fineTarget - FINE_TARGET_HYST &&
-        avg < (float)fineTarget + FINE_TARGET_HYST)
-        target = fineTarget;
+    if (fineTarget && target != fineTarget) {
+        const float delta = avg - (float)fineTarget;
+        if (delta < 0.0f) {
+            if (delta > -FINE_TARGET_FALL)
+                target = fineTarget;
+        }
+        else if (delta < FINE_TARGET_HYST) {
+            target = fineTarget;
+        }
+    }
     fineTarget = target;
     return target;
 }
@@ -874,8 +884,11 @@ void updateRefreshRateForApp() {
                     if (!probeFromFine)
                         probeCount++;
                     SetDisplayRefreshRate(up);
-                    SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app held before\n",
-                                   check_refresh_rate, up);
+                    // Announce a candidate once. Re-trying the same rate is a routine
+                    // retry, and logging it every minute was most of the log.
+                    if (!probeFromFine || probeFailCount == 0)
+                        SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app held before\n",
+                                       check_refresh_rate, up);
                 }
             }
             else {
