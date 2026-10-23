@@ -336,6 +336,14 @@ static u64 pendingRefreshRequired = 0;
 // 1.8 Hz before it is believed: that follows a full two hertz scene drop, and
 // ignores the noise the panel produces by simply holding the app back.
 #define FINE_TARGET_FALL     1.80f
+// How far above the panel the measurement has to sit before a rise is believed at all.
+// The client publishes whole hertz (estimate_present_fps returns unsigned), so a 50 fps
+// app in front of a 50 Hz panel reads exactly 50.00 almost all the time and 51.00 when
+// one 16-interval window happens to catch only short intervals. That single hertz is
+// the entire width of the feedback signal and it is not evidence of anything. Two
+// hertz, held, is: under FIFO the app cannot present above the panel's rate, so a
+// measurement two hertz clear of it means the app is not the thing being limited.
+#define FINE_RISE_EVIDENCE   1.90f
 
 static bool probeArmed = false;      // last applied change went below the demonstrated max
 static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
@@ -496,7 +504,11 @@ static void fineSampleMeasurement() {
 // Returns 0 when there is nothing trustworthy to follow.
 static uint32_t fineMeasuredTarget() {
     if (!fineAvgValid) {
-        fineTarget = 0;
+        // Keep fineTarget. It is the anchor the deadband below compares against, and
+        // clearing it here was how an overshoot survived: one unusable sample, then the
+        // average restarts from a fresh number and whatever that number rounds to wins
+        // outright. The panel is still where it was; the next sample can still be
+        // measured against it.
         return 0;
     }
     const float avg = fineAvg;
@@ -660,7 +672,17 @@ void updateRefreshRateForApp() {
         GetDisplayRefreshRate(&temp_refreshRate, true);
         uint32_t requestedRate = nx_fps ? (isDocked ? nx_fps->FPSlockedDocked : nx_fps->FPSlocked) : 0;
         fineSampleMeasurement();
-        const uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
+        uint32_t fineRate = (fineSyncEnabled && !isDocked) ? fineMeasuredTarget() : 0;
+        // The panel is never raised on a one hertz measurement. Under FIFO an app
+        // cannot present faster than the panel, so anything it publishes while the
+        // panel is holding it is that panel's rate plus noise - and a panel one hertz
+        // above the content repeats a frame every second, which is a hitch the loop
+        // would have introduced itself. Two hertz of the panel's own rate is the only
+        // evidence that the app wants to go faster, and once the panel does move, the
+        // climb continues one hertz at a time through the probe above.
+        if (fineRate && temp_refreshRate && fineRate > temp_refreshRate &&
+            fineAvg < (float)temp_refreshRate + FINE_RISE_EVIDENCE)
+            fineRate = temp_refreshRate;
         if (fineSyncEnabled && !isDocked) {
             // Fine mode is only as good as the measurement behind it. NX-FPS installs
             // its present hook by rewriting the game's import table, so an app that
@@ -697,7 +719,7 @@ void updateRefreshRateForApp() {
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
                                smooth_x100 / 100, smooth_x100 % 100,
-                               measured, temp_refreshRate);
+                               fineRate, temp_refreshRate);
             }
         }
         uint32_t check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);

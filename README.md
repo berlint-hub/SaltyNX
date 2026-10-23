@@ -160,7 +160,7 @@ Everything else still applies, with two exceptions:
 | deadband | 1 Hz | 0 - a one hertz change is the point |
 | rise / drop / large | 5 s / 20 s / 1.5 s | 4 s / 4 s / 1.5 s |
 | measurement | client's number, used as is | one sample a second, jumping ones refused, the rest smoothed |
-| target deadband | 1 Hz | on the *output*: rises past 1.2 Hz, falls only past 1.8 Hz |
+| target deadband | 1 Hz | on the *output*: rises past 1.2 Hz and only on 2 Hz of evidence, falls only past 1.8 Hz |
 | lock-in test | armed on a drop to the floor | disabled (the loop is the point) |
 
 Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is zero before the first presented frame, so "not measuring yet" must not move the panel.
@@ -244,6 +244,10 @@ Fine mode cannot tell the difference by looking, so it stops looking and starts 
 | the measurement does not follow | the app really runs at that rate | back down, park that rate - five minutes, doubling on each further failure up to half an hour |
 
 There is also a deadband on the requested rate itself, separate from the one on the measurement, and it is not symmetric. Rounding a smoothed value that wanders by half a hertz flips between two neighbours every few seconds, and every flip is a panel mode switch: a game running at 49.5 spent a session alternating 48 -> 49 -> 48 about every forty seconds. So the requested rate only rises once the measurement is more than 1.2 Hz above it - wide, because the resting point of the whole loop is a panel at exactly the app's rate, the one place where the client's sixteen-frame window flickers between one present more than the panel and one fewer. Falling is held to a wider margin still, 1.8 Hz, because a value that runs under the panel rate is normal - the app is being throttled by the panel rather than free-running, and its own count sags accordingly. The client averages sixteen present intervals, so one late interval moves its number by a whole hertz: at a 49 Hz panel the log sat on 47.99 for minutes. Following that sag downwards is what made the panel flap; it now stays put unless the app has clearly dropped two hertz, and a scene that really does fall is still followed.
+
+The fine target may not climb past the panel on a one hertz measurement. The client publishes whole hertz - `estimate_present_fps()` returns an integer - so a 50 fps app in front of a 50 Hz panel reads exactly 50.00 nearly all the time, and 51.00 when one sixteen-interval window catches only short intervals. That single hertz is the entire width of the feedback signal. Under FIFO the app cannot present faster than the panel anyway, so a measurement two hertz clear of the panel is the only evidence that the panel is what is holding it back; a rise now needs that, and the one-hertz climb still happens through the probe above, which is unchanged.
+
+The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
 Fine mode also stopped jumping. On 2.1.29 a single measurement took the panel from 45 to 60 Hz after 1.5 seconds, with the value still reading 45.09 fourteen seconds earlier - a spurious burst of presents, fifteen hertz of mode switch. Rises now always take the full four second hold, and move at most two hertz per step, so a wrong reading costs one step and falls straight back while a real scene change still arrives, one hold at a time. Drops keep their short hold: falling is cheap to be wrong about, and the panel below the app is the judder this whole path exists to remove.
 
