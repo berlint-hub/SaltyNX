@@ -97,6 +97,8 @@ jobs:
                         "fine sync enabled" \
                         "fine: block=" \
                         "plugin=" \
+                        "cap=" \
+                        "missing the FPSLocker target" \
                         "never ran in this process" \
                         "is MISSING - games will start without SaltyNX" \
                         "saltynx_core.elf"; do

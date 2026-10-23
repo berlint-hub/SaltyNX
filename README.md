@@ -344,6 +344,42 @@ SaltyNX: saltynx_bootstrap.elf is MISSING - games will start without SaltyNX and
 
 One more line in that log needs translating, because it looks alarming and is not. `no client on port NethFPS yet` is about the *emulator*: NetherSX2 connects to a private endpoint of this fork and publishes its own `FPSavg` there. A native game never connects to it, so the line is expected background noise in a native-game log and has nothing to do with NX-FPS.
 
+### The target in the overlay, and the bug it exposed
+
+FPSLocker's target field (`FPSlocked`) used to be ignored entirely once fine mode had measured anything, for a good reason: on the client path it is quantised onto the 5 Hz ladder, so following it turned a 47 into a 45 and moved the panel a whole step on one bad sample.
+
+That left no way to say "I want this capped at 50", which is a reasonable thing to want. So the field is read again, as a **ceiling** rather than a source of truth: fine mode follows the measured rate and simply never goes above what was set. Zero means nothing was set and the whole window is available.
+
+The cap is applied *after* the deadband, and that ordering is the whole point. The deadband anchors on the last target, so a panel that reached 60 before a target of 50 was set would compute "60 is where I already am, the measurement is 60, nothing to do" and sit there forever - the target would be ignored for exactly as long as the content stayed above it. A ceiling is not a preference to be smoothed.
+
+Two deliberate exceptions:
+
+- **Sub-floor content ignores the ceiling.** Below 45 fps the target is a repeat factor, not a tracked rate, and the only good factor is the one that divides the content evenly. 30 fps at 60 Hz shows every frame exactly twice; 30 fps at 45 Hz shows one frame once and the next twice, forever. Capping the multiple would produce a strictly worse picture, so it does not.
+- **A display-sync client suppresses it for the session.** NetherSX2 writes `FPSlocked` from its own measurement, quantised - around a 47 fps scene it publishes 45. Honouring that as a ceiling would pin the panel at 45 and undo the entire reason fine mode exists, which is escaping that ladder. A client connected to this fork's private endpoint is exactly such a writer, so the cap is off for that session and the measurement speaks for itself. The log says so once.
+
+Worth knowing: FPSLocker steps its target by five, so 45, 50, 55 and 60 are reachable from the overlay and 47/48/49 are not. The sysmodule itself honours any value in the window, so a client that writes 47 gets 47 - it is the overlay's ladder that cannot express it.
+
+### A feature that never worked, and why
+
+2.1.36 taught the loop to send sub-floor content to a whole multiple of its rate - 30 fps to 60 Hz instead of clamping to 45. The arithmetic was right and it was dead on arrival.
+
+The rise gate above it refuses any target higher than the panel unless the measurement has first climbed `FINE_RISE_EVIDENCE` above the panel:
+
+```c
+if (fineRate > temp_refreshRate && fineAvg < temp_refreshRate + FINE_RISE_EVIDENCE)
+    fineRate = temp_refreshRate;
+```
+
+At 30 fps on a 45 Hz panel the target is 60, the measurement is 30, and `30 < 45 + 1.9` is true on every sample for as long as the game runs. So the panel sat at 45 with a 1.5:1 ratio - a hitch on every frame - and the branch could never lift it, because the app can never measure above the panel it is stuck behind under vsync.
+
+The gate is correct and stays; it just must not apply to a repeat factor. A 1:1 target above the panel is a claim that the app wants a higher rate, and that claim needs evidence. A multiple is derived *from* the panel being wrong in the first place, so demanding that the app first measure above the panel is demanding proof of the thing being fixed.
+
+`fine:` now carries `cap=`, so a capped panel is never a mystery:
+
+```
+fine: block=found plugin=1 FPS=30 FPSavg=30.00 meas=30.00 target=60 panel=60 peak=60.0 cap=0
+```
+
 ### FPSLocker, or this? They answer different questions
 
 FPSLocker is an overlay that sets a target. This is a loop that follows one. The distinction sounds academic until it meets a game whose frame rate wanders, which is most of them.

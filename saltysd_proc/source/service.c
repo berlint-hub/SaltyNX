@@ -1425,6 +1425,7 @@ void serviceThreadDisplaySync(void* portHandle)
             if (r.HasPid && (u64)r.Pid != lastClientPid)
             {
                 lastClientPid = (u64)r.Pid;
+                displaySyncClientSeen = true;
                 SERVICE_LOG_MIN("client PID %lu connected (SaltyNX %s)", lastClientPid, APP_VERSION);
             }
 

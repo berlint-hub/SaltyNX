@@ -36,6 +36,7 @@ static u8 displaySyncThreadStack[0x6000] __attribute__((aligned(0x1000)));
 static char g_heap[0x30000];
 bool already_hijacking = false;
 bool should_terminate = false;
+bool displaySyncClientSeen = false;
 u64 exception = 0x0;
 SharedMemory _sharedMemory = {0};
 size_t reservedSharedMemory = 0;
@@ -542,6 +543,13 @@ static float finePeak = 0.0f;
 // escape test keeps. fineEverMeasured: the app has published at least one usable
 // value, so a later silence is a pause, not a missing publisher.
 static uint32_t fineTarget = 0;
+// Whether fineTarget was chosen by the repeat-factor path rather than by rounding the
+// measurement. The two mean different things and the rise gate below has to tell them
+// apart: a 1:1 target above the panel is a claim that the app wants a higher rate, while
+// a multiple is derived FROM the panel being wrong, so requiring the app to first measure
+// above the panel is requiring proof of the thing being fixed.
+static bool fineTargetIsMultiple = false;
+static bool capSuppressedLogged = false;
 // When the panel was last written. FINE_CHANGE_MIN_MS is measured from here, so the
 // limit survives a target that changes twice in quick succession.
 static u64 fineLastApplyTick = 0;
@@ -703,6 +711,44 @@ static uint32_t fineMultipleTarget(float avg) {
 }
 
 // Returns 0 when there is nothing trustworthy to follow.
+// What the user asked for, as FPSLocker's target field. With display sync on, this loop
+// is what acts on that number - so it becomes a ceiling: fine mode follows the measured
+// rate and never goes above this. Zero means nothing was set, and the whole window is
+// available, which is the ordinary case.
+//
+// A target below the floor is served as the floor, because the panel cannot go lower.
+//
+// Not every writer of FPSlocked is expressing a preference, and that distinction is the
+// whole correctness of this function. FPSLocker writes it because a person chose a number.
+// NetherSX2 writes it from its own measurement, quantised onto the 5 Hz ladder - so around
+// a 47 fps scene it publishes 45. Honouring that as a ceiling would pin the panel at 45
+// and undo the reason fine mode exists: the ladder is the thing being escaped, and one
+// bad sample would become a whole ladder step down. A client connected to this fork's
+// private endpoint is exactly such a writer, and it is also the only one, so the cap is
+// suppressed for that session and the measurement speaks for itself.
+static uint32_t fineCapRate() {
+    if (!nx_fps)
+        return 0;
+    if (displaySyncClientSeen) {
+        if (nx_fps->FPSlocked && !capSuppressedLogged) {
+            capSuppressedLogged = true;
+            SaltyNX_printf(APP_NAME ": display-sync: ignoring the %u Hz FPSLocker target for this "
+                           "session - a display-sync client is deriving it from its own "
+                           "measurement, and fine mode follows that directly\n",
+                           (unsigned)nx_fps->FPSlocked);
+        }
+        return 0;
+    }
+    const uint32_t want = nx_fps->FPSlocked;
+    if (want == 0)
+        return 0;
+    if (want < HandheldModeRefreshRateAllowed.min)
+        return HandheldModeRefreshRateAllowed.min;
+    if (want > HandheldModeRefreshRateAllowed.max)
+        return HandheldModeRefreshRateAllowed.max;
+    return want;
+}
+
 static uint32_t fineMeasuredTarget() {
     if (!fineAvgValid) {
         // Keep fineTarget. It is the anchor the deadband below compares against, and
@@ -717,11 +763,24 @@ static uint32_t fineMeasuredTarget() {
     // so the deadband below has nothing to compare against and fineMultipleTarget does
     // its own hysteresis in content space.
     const bool belowFloor = avg < (float)HandheldModeRefreshRateAllowed.min;
+    const uint32_t cap = fineCapRate();
+    const uint32_t ceiling = (cap && cap < HandheldModeRefreshRateAllowed.max)
+                           ? cap : HandheldModeRefreshRateAllowed.max;
     uint32_t target = (uint32_t)(avg + 0.5f);
-    if (belowFloor)
+    fineTargetIsMultiple = belowFloor;
+    if (belowFloor) {
+        // The target set in the overlay is a ceiling on *tracking*, and this is not
+        // tracking. Below the floor there is nothing to track - the panel cannot match
+        // the content, so a repeat factor is chosen instead, and the only good factor is
+        // the one that divides the content evenly. Capping it produces a ratio that is
+        // worse than ignoring the cap: 30 fps at 60 Hz shows every frame twice, 30 fps at
+        // 45 Hz shows one frame once and the next twice, forever. So the multiple wins
+        // over the ceiling, deliberately, and the fine: line reports both numbers.
         target = fineMultipleTarget(avg);
-    else if (target > HandheldModeRefreshRateAllowed.max)
+    }
+    else if (target > HandheldModeRefreshRateAllowed.max) {
         target = HandheldModeRefreshRateAllowed.max;
+    }
     // Stay where we are while the measurement is still grazing the rate we already
     // asked for. Without this a smoothed 48.9 rounds to 49, drops the panel, and the
     // next sample rounds back to 50 - a mode switch every few seconds that looks
@@ -736,6 +795,13 @@ static uint32_t fineMeasuredTarget() {
             target = fineTarget;
         }
     }
+    // The cap is applied after the deadband, not before, and that ordering is the whole
+    // point. The deadband anchors on fineTarget, so a panel that reached 60 before a
+    // target of 50 was set would see "60 is where I already am, the measurement is 60,
+    // there is nothing to do" and sit there forever - the target would be ignored for as
+    // long as the content stayed above it. A ceiling is not a preference to be smoothed.
+    if (!belowFloor && target > ceiling)
+        target = ceiling;
     fineTarget = target;
     return target;
 }
@@ -809,6 +875,7 @@ static bool runTestSweep() {
 
 void cleanAppData() {
     lastAppPID = -1;
+    displaySyncClientSeen = false;
     nx_fps = 0;
     cheatCheck = false;
     pendingRefreshRate = 0;
@@ -825,6 +892,8 @@ void cleanAppData() {
     finePinnedSince = 0;
     finePeak = 0.0f;
     fineTarget = 0;
+    fineTargetIsMultiple = false;
+    capSuppressedLogged = false;
     fineLastApplyTick = 0;
     fineEverMeasured = false;
     probeFailCount = 0;
@@ -892,7 +961,17 @@ void updateRefreshRateForApp() {
         // would have introduced itself. Two hertz of the panel's own rate is the only
         // evidence that the app wants to go faster, and once the panel does move, the
         // climb continues one hertz at a time through the probe above.
+        //
+        // It must not apply to a repeat factor, and applying it there was a real defect:
+        // at 30 fps on a 45 Hz panel the target is 60, the measurement is 30, and
+        // "30 < 45 + 1.9" is true on every sample for as long as the game runs - so the
+        // one case the multiple exists for was the one case it could never reach. The
+        // panel sat at 45 with a 1.5:1 ratio, a hitch on every frame, and the gate below
+        // could not lift it because the app never measures above the panel it is stuck
+        // behind. A multiple is derived from the panel being wrong, so demanding that the
+        // app first measure above the panel is demanding proof of the thing being fixed.
         if (fineRate && temp_refreshRate && fineRate > temp_refreshRate &&
+            !fineTargetIsMultiple &&
             fineAvg < (float)temp_refreshRate + FINE_RISE_EVIDENCE)
             fineRate = temp_refreshRate;
         if (fineSyncEnabled && !isDocked) {
@@ -937,14 +1016,15 @@ void updateRefreshRateForApp() {
                 // never initialised at all. Those are different faults with different
                 // owners, and until now both looked like "the plugin is not running".
                 const uint32_t plugin = (nx_fps && nx_fps->pluginActive) ? 1u : 0u;
-                SaltyNX_printf(APP_NAME ": fine: block=%s plugin=%u FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u\n",
+                SaltyNX_printf(APP_NAME ": fine: block=%s plugin=%u FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u cap=%u\n",
                                nx_fps ? "found" : "missing",
                                plugin,
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
                                meas_x100 / 100, meas_x100 % 100,
                                fineRate, temp_refreshRate,
-                               peak_x10 / 10, peak_x10 % 10);
+                               peak_x10 / 10, peak_x10 % 10,
+                               fineCapRate());
             }
         }
         // Once fine mode has measured anything, it is the authority and the client's

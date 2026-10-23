@@ -259,6 +259,9 @@ void hijack_pid(u64 pid)
     
     if (hijack_bootstrap(&debug, pid, threadid, isA64)) {
         lastAppPID = pid;
+        // A new app starts with no client seen, so the previous title's emulator cannot
+        // leave the cap suppressed for the next one.
+        displaySyncClientSeen = false;
         
         LoaderModuleInfo module_infos[2] = {0};
         s32 module_infos_count = 0;
