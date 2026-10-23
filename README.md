@@ -249,6 +249,28 @@ The fine target may not climb past the panel on a one hertz measurement. The cli
 
 The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
+### FPSLocker, or this? They answer different questions
+
+FPSLocker is an overlay that sets a target. This is a loop that follows one. The distinction sounds academic until it meets a game whose frame rate wanders, which is most of them.
+
+| | FPSLocker | fine mode |
+|---|---|---|
+| granularity in handheld | **5 Hz** - 15/20/25/30/35/40/45/50/55/60 | **1 Hz**, every integer 45..60 |
+| open or closed loop | open - writes a value and trusts it | closed - measures, then decides |
+| per game | yes, saved profile | follows whatever is running |
+| needs a UI | yes, a Tesla overlay | no |
+| can express 47 | no | yes |
+
+The ladder is not a limitation anyone chose on a whim: `AllowedFPSTargets[32] = {15, 20, 25, 30, 35, 40, 45, 50, 55, 60}` in FPSLocker's `source/main.cpp`. The values this subsystem has spent weeks debugging - 47, 48, 49, 51 - are not on it. A 50 fps game pinned to 50 is fine; a 47 fps scene has nowhere to go except 45, and a panel 5 Hz below the content is a repeated frame every 200 ms.
+
+The two are wired to be mutually exclusive, and FPSLocker already knows it. Its sync toggle calls `SaltySD_SetDisplaySync`, which sets `displaySync` here, which gates the entire automatic path - fine mode included. Turn sync off in FPSLocker and the rate selector is in charge; turn it on and this subsystem is. Both directions work with this fork: the IPC command ids match FPSLocker's `include/SaltyNX.h` exactly (0 end, 6 check-shared, 7 shared-handle, 10 get-rate, 11 set-rate, 12 set-sync, 13..19 the docked and policy calls), and nothing in FPSLocker checks a version string.
+
+**Use FPSLocker when you know the answer.** A game that runs at a rock solid 30 and looks best at 60, a title you want pinned at 55 to cut power, anything where you have decided. 5 Hz granularity is fine when the content is not near a boundary.
+
+**Use fine mode when you do not.** Content that wanders between 50 and 60 depending on the scene, or a PAL title whose real rate is 50 but whose measurement is 49.6. That is where 5 Hz becomes a visible mode switch and 1 Hz does not.
+
+**If fine mode keeps disappointing you, FPSLocker plus sync off is a legitimate answer.** It is a mature tool, the rates are stable because nothing is adapting, and you get per-game profiles. It will not find 50 on its own and it cannot sit at 47, but nothing about it oscillates.
+
 ### Two masters, one control
 
 With vsync on, the panel paces the emulator: set 47 Hz and the emulator presents 47 frames. That is the whole reason the fine path exists, and it has a consequence that is easy to miss - **the measurement can never show that the app wants to go faster**, because the app is being shown at the rate the panel is already running. `FPSavg` reports what the panel did, not what the content could do.
