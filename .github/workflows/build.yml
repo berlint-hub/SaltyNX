@@ -98,7 +98,8 @@ jobs:
                         "fine: block=" \
                         "plugin=" \
                         "never ran in this process" \
-                        "saltynx_core.elf is MISSING"; do
+                        "is MISSING - games will start without SaltyNX" \
+                        "saltynx_core.elf"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else
