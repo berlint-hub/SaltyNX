@@ -182,13 +182,16 @@ jobs:
     container:
       image: docker.io/devkitpro/devkita64:latest
       options: --user root
+    env:
+      BASELINE: a3fee3fbe05c494d5246f9fe61066c429c09528a
+      BASELINE_VERSION: "2.1.3"
     steps:
       - name: Tools the image may lack
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq || echo "::warning::apt-get update failed"
           apt-get install -y --no-install-recommends \
-            make git ca-certificates zip || echo "::warning::some apt packages failed"
+            make git ca-certificates curl zip || echo "::warning::some apt packages failed"
 
       # Full history, because the baseline is an older commit rather than the tip.
       - uses: actions/checkout@v4
@@ -209,17 +212,43 @@ jobs:
         run: |
           set -eu
           say() { echo "::notice::$1"; }
+          fail() { echo "::error::$1"; exit 1; }
           mkdir -p upstream
-          git archive a3fee3f | tar -x -C upstream
-          say "baseline commit: $(git rev-parse --short a3fee3f) $(git log -1 --format=%s a3fee3f)"
-          say "baseline $(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)"
+
+          # Preferred path: the baseline is an ancestor of this branch, so a full
+          # checkout already has it and nothing needs downloading.
+          if git cat-file -e "$BASELINE^{commit}" 2>/dev/null; then
+            git archive --format=tar -o /tmp/baseline.tar "$BASELINE" \
+              || fail "git archive $BASELINE failed"
+          else
+            # Fallback, so the job does not depend on how the ref was fetched: fetch the
+            # same tree from the forge and check it is the version expected.
+            say "$BASELINE not present in the checkout, downloading the upstream tarball"
+            curl -fsSL -o /tmp/baseline.tgz \
+              "https://codeload.github.com/masagrator/SaltyNX/tar.gz/refs/heads/master" \
+              || fail "could not download the upstream tarball"
+            tar -xzOf /tmp/baseline.tgz --wildcards '*/version.mk' > /tmp/upver.mk \
+              || fail "could not read version.mk from the tarball"
+            [ "$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' /tmp/upver.mk)" = "$BASELINE_VERSION" ] \
+              || fail "upstream master is no longer $BASELINE_VERSION; pin the baseline explicitly"
+            tar -xzf /tmp/baseline.tgz -C upstream --strip-components=1 \
+              || fail "could not extract the upstream tarball"
+          fi
+
+          if [ -f /tmp/baseline.tar ]; then
+            tar -xf /tmp/baseline.tar -C upstream || fail "could not extract $BASELINE"
+          fi
+
+          [ -f upstream/Makefile ] || fail "baseline tree has no Makefile"
+          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)
+          say "baseline version: $ver"
+
           # Anything of ours that leaked into the baseline would make the comparison
           # meaningless, so say so rather than discovering it after a flash.
           if [ -e upstream/saltysd_proc/source/display_sync.h ]; then
-            echo "::error::baseline tree contains fork-only files"
-            exit 1
+            fail "baseline tree contains fork-only files"
           fi
-          say "baseline tree carries no fork-only sources"
+          say "baseline tree carries no fork-only sources ($(find upstream -type f | wc -l) files)"
 
       - name: Build
         run: make -C upstream -j2
