@@ -449,6 +449,10 @@ static float finePeak = 0.0f;
 static uint32_t fineTarget = 0;
 static bool fineEverMeasured = false;
 static uint32_t probeFailCount = 0;
+// Set while a fine probe has just been followed, cleared as soon as one is not. A
+// climb is the one state in which the next probe is worth spending without asking for
+// more evidence first - the previous one already proved the panel was the limiter.
+static bool fineClimbing = false;
 
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
@@ -622,6 +626,7 @@ void cleanAppData() {
     fineTarget = 0;
     fineEverMeasured = false;
     probeFailCount = 0;
+    fineClimbing = false;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;
@@ -756,7 +761,16 @@ void updateRefreshRateForApp() {
             // The client path quantises to 5 Hz, so one hertz of slack there; the
             // measured path does not, and a panel one hertz above what the app can fill
             // is a judder the test itself created.
-            if (check_refresh_rate + (probeFromFine ? 0u : 1u) >= probeTarget) {
+            // The fine test has to read the measurement, not the target. The target is
+            // deliberately frozen by FINE_TARGET_HYST, which is 1.2 Hz wide, and a fine
+            // probe moves one hertz - so a probe could never be ratified through the
+            // target, the panel fell back six seconds later, and the only direction that
+            // ever stuck was down. On the device that showed up as 45 -> 46 -> 45 -> 46
+            // forever after a single dip, never once recovering to 50.
+            const bool followed = probeFromFine
+                                ? (fineAvgValid && fineAvg + 0.5f >= (float)probeTarget)
+                                : (check_refresh_rate + 1u >= probeTarget);
+            if (followed) {
                 uint32_t achieved = 0;
                 if (GetDisplayRefreshRate(&achieved, true))
                     SaltyNX_printf(APP_NAME ": display-sync: %u Hz was not a lock, target followed to %u Hz (active %u Hz)\n",
@@ -764,6 +778,15 @@ void updateRefreshRateForApp() {
                 else
                     SaltyNX_printf(APP_NAME ": display-sync: %u Hz was not a lock, target followed to %u Hz\n",
                                    probeFromRate, check_refresh_rate);
+                // A fine probe that the app followed is the only evidence that can move
+                // this loop upward while the panel sets the pace, so the rate it proved
+                // becomes the anchor the deadband compares against. Without that the
+                // deadband immediately argues for the rate we just left and the gain is
+                // undone in four seconds.
+                if (probeFromFine) {
+                    fineTarget = probeTarget;
+                    fineClimbing = true;
+                }
                 probeFromRate = 0;
                 probeArmed = false;
                 probeFromFine = false;
@@ -779,6 +802,8 @@ void updateRefreshRateForApp() {
                 probeFailedSince = now;
                 if (probeFailCount < 8)
                     probeFailCount++;
+                if (probeFromFine)
+                    fineClimbing = false;
                 if (GetDisplayRefreshRate(&achieved, true))
                     SaltyNX_printf(APP_NAME ": display-sync: %u Hz is real, back from the test (target %u Hz, active %u Hz)\n",
                                    probeFromRate, check_refresh_rate, achieved);
@@ -889,19 +914,29 @@ void updateRefreshRateForApp() {
             // pushed to 51 every fifteen seconds forever, which is a defect of its own.
             const float agree = fineAvg - (float)temp_refreshRate;
             const bool measurementOnPanel = fineAvgValid && agree < 0.6f && agree > -0.6f;
-            // One whole hertz of headroom, measured earlier in this session. A peak of
-            // 50.8 next to a 50 Hz panel is the app grazing its own rate, not evidence
-            // that the panel is holding it back, and testing it costs a visible
-            // excursion for nothing.
-            const bool worthTesting = finePeak >= (float)temp_refreshRate + 1.0f;
+            // Three reasons to spend an excursion, and no others:
+            //  - the app was measured above this rate earlier in the session, so the
+            //    panel is probably what is holding it back;
+            //  - the panel is sitting on the floor, which is a clamp rather than a
+            //    content-derived rate - nothing else can ever lift it off 45, so it is
+            //    owed a test even when nothing has been demonstrated;
+            //  - a climb is already in progress, so the previous probe proved the point
+            //    and the next hertz is worth trying.
+            const bool worthTesting = finePeak >= (float)temp_refreshRate + 1.0f ||
+                                      temp_refreshRate <= DISPLAY_SYNC_MIN_RATE ||
+                                      fineClimbing;
             if (fineRate && measurementOnPanel && worthTesting &&
                 temp_refreshRate < HandheldModeRefreshRateAllowed.max && !probeFromRate) {
                 if (finePinnedSince == 0)
                     finePinnedSince = now;
                 const bool parked = (temp_refreshRate == probeFailedRate) &&
                                     (now - probeFailedSince < fineRetryWindowMs() * SV_TICKS_PER_MS);
+                // A floor probe and a continuing climb do not wait out the fifteen
+                // seconds: in both cases the reason is already established, and waiting
+                // only slows the recovery from a dip that landed on the clamp.
+                const bool reasonKnown = fineClimbing || temp_refreshRate <= DISPLAY_SYNC_MIN_RATE;
                 if (!probeArmed && !parked &&
-                    now - finePinnedSince >= FINE_LOCK_SUSPECT_MS * SV_TICKS_PER_MS)
+                    (reasonKnown || now - finePinnedSince >= FINE_LOCK_SUSPECT_MS * SV_TICKS_PER_MS))
                     probeArmed = true;
                 if (probeArmed && probeTarget == 0) {
                     uint32_t up = temp_refreshRate + FINE_LOCK_STEP;
@@ -913,6 +948,10 @@ void updateRefreshRateForApp() {
                 }
             }
             else if (!measurementOnPanel) {
+                // Do not end the climb here. Right after a probe the panel has moved but
+                // the average has not caught up yet, so the two disagree for a few
+                // seconds by construction. A climb ends when a probe fails or when the
+                // loop moves the panel down, both of which are handled where they happen.
                 finePinnedSince = 0;
             }
             if (probeArmed && probeTarget > check_refresh_rate) {

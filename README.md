@@ -249,6 +249,26 @@ The fine target may not climb past the panel on a one hertz measurement. The cli
 
 The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
+### Why the panel used to sink and stay sunk
+
+Reported on 2.1.31 as "turn on handheld display sync and it drops to 45 Hz and stays there". It was a real defect, and the mechanism is worth writing down because everything in it looks correct in isolation.
+
+A fine probe moves the panel **one** hertz (`FINE_LOCK_STEP`). The target deadband is **1.2** hertz (`FINE_TARGET_HYST`). The probe's success test asked whether the *target* had reached the tested rate - and the target is exactly the value the deadband freezes. So a settled measurement at 45.0 next to a 46 Hz panel produced a target of 45 (the rise was 1.0 Hz, inside the 1.2 Hz band), the test read 45 against a target of 46, declared the rate real, and put the panel back four seconds later. Every upward probe was a no-op by construction.
+
+That makes the loop one-way. Downward moves are self-confirming: once the panel drops below the app, the client follows the panel, reports the panel's rate back, and that number keeps agreeing with the new rate. Nothing in the measurement can ever argue upward again, because the probe - the only channel that can - was structurally unable to succeed. One dip, and the panel walked to the floor.
+
+Simulated against the shipped logic with a display-synced client and one 25 second menu dip, that is 64 panel mode switches in twelve minutes, ending at 49 Hz and flickering 45 <-> 46. The device shows the same shape in the 2.1.26 log (`45 Hz was not a lock, target followed to 46 Hz`, then back).
+
+Three changes:
+
+- The fine test reads the **measurement**, not the target: the app counts as having followed when the smoothed value reaches the tested rate. The target is deliberately frozen; it cannot also be the verdict.
+- A followed probe **ratifies the anchor** (`fineTarget = probeTarget`), so the deadband cannot immediately argue for the rate we just left and undo the gain in four seconds.
+- A climb is a state. While one is in progress the next hertz is worth trying without waiting for fresh evidence, and it ends when a probe fails or the panel moves down.
+
+The floor also earns a test of its own. 45 Hz is a clamp, not a content-derived rate, so nothing else can ever lift the panel off it; a panel sitting on the floor is now owed an upward test even if the app has never demonstrated headroom. The parking backoff still applies, so a title that genuinely runs at 43 pays one six second excursion every five minutes, doubling to half an hour.
+
+The same simulation with these changes: 9 switches and settled at 50 Hz.
+
 Fine mode also stopped jumping. On 2.1.29 a single measurement took the panel from 45 to 60 Hz after 1.5 seconds, with the value still reading 45.09 fourteen seconds earlier - a spurious burst of presents, fifteen hertz of mode switch. Rises now always take the full four second hold, and move at most two hertz per step, so a wrong reading costs one step and falls straight back while a real scene change still arrives, one hold at a time. Drops keep their short hold: falling is cheap to be wrong about, and the panel below the app is the judder this whole path exists to remove.
 
 The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end.
