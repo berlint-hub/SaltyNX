@@ -168,3 +168,86 @@ jobs:
           name: SaltyNX-build
           path: artifact/
           if-no-files-found: error
+
+  # Differential baseline. Builds the pristine upstream tree this branch was started
+  # from, with the same toolchain, in the same run, and ships it as its own artifact.
+  #
+  # The point is to settle "is this our change or something else" with a file instead of
+  # an argument: flash the upstream artifact, reproduce, and the answer is whichever of
+  # the two builds behaves. a3fee3f was verified byte for byte against
+  # masagrator/SaltyNX master - 231 files, no differences - so this job builds what a
+  # stock install of the same release would contain, minus our commits.
+  upstream:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/devkitpro/devkita64:latest
+      options: --user root
+    steps:
+      - name: Tools the image may lack
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq || echo "::warning::apt-get update failed"
+          apt-get install -y --no-install-recommends \
+            make git ca-certificates zip || echo "::warning::some apt packages failed"
+
+      # Full history, because the baseline is an older commit rather than the tip.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install devkitARM for the 32-bit payloads
+        run: |
+          if [ ! -f "$DEVKITPRO/devkitARM/base_rules" ]; then
+            PM=$(command -v dkp-pacman || command -v pacman)
+            echo "using $PM"
+            "$PM" -S --needed --noconfirm --disable-download-timeout devkitARM \
+              || "$PM" -Sy --needed --noconfirm --disable-download-timeout devkitARM
+          fi
+          test -f "$DEVKITPRO/devkitARM/base_rules"
+
+      - name: Extract the upstream tree
+        run: |
+          set -eu
+          say() { echo "::notice::$1"; }
+          mkdir -p upstream
+          git archive a3fee3f | tar -x -C upstream
+          say "baseline commit: $(git rev-parse --short a3fee3f) $(git log -1 --format=%s a3fee3f)"
+          say "baseline $(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)"
+          # Anything of ours that leaked into the baseline would make the comparison
+          # meaningless, so say so rather than discovering it after a flash.
+          if [ -e upstream/saltysd_proc/source/display_sync.h ]; then
+            echo "::error::baseline tree contains fork-only files"
+            exit 1
+          fi
+          say "baseline tree carries no fork-only sources"
+
+      - name: Build
+        run: make -C upstream -j2
+
+      - name: Verify and package
+        run: |
+          set -eu
+          say() { echo "::notice::$1"; }
+          ver=$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' upstream/version.mk)
+          for f in upstream/saltysd_bootstrap/saltynx_bootstrap.elf \
+                   upstream/saltysd_bootstrap/saltynx_bootstrap32.elf \
+                   upstream/saltysd_core/saltynx_core.elf \
+                   upstream/saltysd_core/saltynx_core32.elf \
+                   upstream/saltysd_proc/saltynx_proc.nsp \
+                   upstream/sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp; do
+            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+            say "$(stat -c%s "$f") B  $f"
+          done
+          mkdir -p artifact-upstream
+          (cd upstream/sdcard_out && zip -qr ../../artifact-upstream/SaltyNX-upstream-${ver}-sdcard.zip .)
+          cp upstream/sdcard_out/atmosphere/contents/0000000000534C56/exefs.nsp \
+             "artifact-upstream/exefs-upstream-${ver}.nsp"
+          say "baseline artifact: SaltyNX-upstream-${ver}-sdcard.zip"
+          ls -la artifact-upstream
+          sha256sum artifact-upstream/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SaltyNX-upstream-baseline
+          path: artifact-upstream/
+          if-no-files-found: error
