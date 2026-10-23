@@ -375,11 +375,13 @@ static float fineAvg = 0.0f;
 static bool fineAvgValid = false;
 static u64 fineSampleTick = 0;
 static uint32_t fineRejects = 0;
+static uint32_t fineInvalid = 0;
 
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
         fineAvgValid = false;
         fineRejects = 0;
+        fineInvalid = 0;
         return;
     }
     const u64 now = svcGetSystemTick();
@@ -388,14 +390,24 @@ static void fineSampleMeasurement() {
     fineSampleTick = now;
 
     const float avg = nx_fps->FPSavg;
-    // FPSavg starts at 255 in NX-FPS and stays 0 before the first PostFrame, so
-    // anything outside a plausible range means "not measuring yet".
+    // FPSavg is 255 in NX-FPS before the first frame, 0 before a client
+    // publishes anything, and lands in 14..29 for a second or two after a
+    // multi-second hitch - the client measures frame intervals, and one stall
+    // dominates a sixteen frame window. Discarding the whole average over one
+    // such sample is exactly what the jump rejection was meant to prevent: the
+    // panel would fall back to the client's 5 Hz path, floor and probe
+    // included, and climb to 55. So a single unusable sample is skipped and
+    // only a sustained absence of any usable value gives up the average.
     if (!(avg >= 30.0f && avg <= 240.0f)) {
+        if (fineAvgValid && ++fineInvalid < FINE_REJECT_MAX)
+            return;
         fineAvgValid = false;
         fineAvg = 0.0f;
         fineRejects = 0;
+        fineInvalid = 0;
         return;
     }
+    fineInvalid = 0;
     if (!fineAvgValid) {
         fineAvg = avg;
         fineAvgValid = true;
@@ -563,11 +575,11 @@ void updateRefreshRateForApp() {
             else if (nx_fps) {
                 if (fineNoDataSince == 0)
                     fineNoDataSince = nowFine;
-                else if (!fineNoDataLogged && nowFine - fineNoDataSince >= 15000ULL * SV_TICKS_PER_MS) {
+                else if (!fineNoDataLogged && nowFine - fineNoDataSince >= 30000ULL * SV_TICKS_PER_MS) {
                     fineNoDataLogged = true;
                     const uint32_t avg_x100 = (uint32_t)(nx_fps->FPSavg * 100.0f);
-                    SaltyNX_printf(APP_NAME ": fine: no measurement after 15 s (FPS=%u FPSavg=%u.%02u) - "
-                                   "the NX-FPS present hook is not running for this app, "
+                    SaltyNX_printf(APP_NAME ": fine: no measurement after 30 s (FPS=%u FPSavg=%u.%02u) - "
+                                   "nothing is publishing FPSavg for this app, "
                                    "falling back to the client target\n",
                                    (u32)nx_fps->FPS, avg_x100 / 100, avg_x100 % 100);
                 }
