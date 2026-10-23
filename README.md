@@ -137,17 +137,18 @@ Note that this only stops the flapping. Smooth pacing still needs the *client* t
 
 ### Fine mode: follow the measured rate to the hertz
 
-The 2.1.20 sweep proved the panel takes every integer rate from 45 to 52 exactly, one hertz apart. That makes a real 1 Hz sync possible - but not through the client, which quantises its target to 5 Hz. The sysmodule already has a measured source of its own: NX-FPS writes an EMA of the frame interval into the shared block as `FPSavg` on every presented frame, for NVN, EGL and Vulkan alike.
+The 2.1.20 sweep proved the panel takes every integer rate from 45 to 52 exactly, one hertz apart. That makes a real 1 Hz sync possible - but not through the client, which quantises its target to 5 Hz. The sysmodule already has a measured source of its own: `FPSavg` in the shared block, written on every presented frame by NX-FPS, or by the client itself when the NX-FPS hook does not run in that process.
 
-Fine mode follows that instead of `FPSlocked`:
-
-```
-sdmc:/SaltySD/flags/sync_fine.flag        (create, then reboot)
-```
+**On by default since 2.1.26.** The window is the whole 45..60 Hz, one hertz apart, and the measured path is what makes 45-49 reachable at all.
 
 ```
-SaltyNX: fine sync enabled from sdmc:/SaltySD/flags/sync_fine.flag, following the measured rate to the hertz
-SaltyNX: display-sync: refresh rate 50 -> 49 Hz requested (target held 5013 ms, active 49 Hz, measured)
+sdmc:/SaltySD/flags/sync_fine.flag        (optional - it is on without this)
+sdmc:/SaltySD/flags/sync_fine_off.flag    (create to fall back to the client target)
+```
+
+```
+SaltyNX: fine sync enabled by default, following the measured rate to the hertz
+SaltyNX: display-sync: refresh rate 50 -> 49 Hz requested (target held 4008 ms, active 49 Hz, measured)
 ```
 
 Everything else still applies, with two exceptions:
@@ -155,7 +156,7 @@ Everything else still applies, with two exceptions:
 | | normal mode | fine mode |
 | --- | --- | --- |
 | target source | client's `FPSlocked` (5 Hz table) | NX-FPS `FPSavg` (measured, 1 Hz) |
-| floor | 50 Hz | the panel's own minimum (45 Hz on OLED) |
+| floor | 45 Hz (the panel's own minimum) | 45 Hz (the panel's own minimum) |
 | deadband | 1 Hz | 0 - a one hertz change is the point |
 | rise / drop / large | 5 s / 20 s / 1.5 s | 4 s / 4 s / 1.5 s |
 | measurement | client's number, used as is | one sample a second, jumping ones refused, the rest smoothed |
@@ -210,28 +211,52 @@ Display sync is suspended for the duration of the sweep and resumes afterwards, 
 
 What this does **not** test: the sync loop itself at 1 Hz granularity. That needs a client that publishes 48/49/51/52, and NetherSX2 quantises to 5 Hz. The sweep proves the panel side of the question - whether the hardware and the PLLD solver can hit those rates at all.
 
-### The handheld window is 50/55/60, never lower
+### The handheld window is 45..60, one hertz apart
 
-`updateRefreshRateForApp()` used to follow whatever the client published. Since 2.1.18 a measured target below 50 Hz is ignored in handheld mode and 50 is applied instead:
+2.1.18 clamped the automatic path to 50/55/60 to avoid the feedback loop described below: a slow scene publishes 45, the panel drops to 45, the compositor then paces the app at 45, and from that point a genuine 45 FPS game and a panel holding the app down are the same thing. Refusing to enter that state was cheaper than escaping it.
+
+2.1.26 removes the clamp, because the loop now has an exit. The window is the panel's own 45..60, one hertz apart, and everything in it is reachable:
 
 ```c
-if (!isDocked && requestedRate && check_refresh_rate < DISPLAY_SYNC_MIN_RATE)
-    check_refresh_rate = DISPLAY_SYNC_MIN_RATE;
+#define DISPLAY_SYNC_MIN_RATE 45u
 ```
 
-The reason is the feedback loop described below: a slow scene publishes 45, the panel drops to 45, the compositor then paces the app at 45, and from that point a genuine 45 FPS game and a panel holding the app down are the same thing. Refusing to enter that state is cheaper than escaping it.
+Only the client's own quantised target is clamped - a client that publishes 25 gets the floor:
 
 ```
-SaltyNX: display-sync: ignoring the 45 Hz target, this sync never goes below 50 Hz
+SaltyNX: display-sync: ignoring the 25 Hz target, this sync never goes below 45 Hz
 ```
 
-The clamp only applies to a target the display-sync client *measured*. A rate set by hand - FPSLocker, or the legacy `SetDisplayRefreshRate` path NetherSX2 uses at startup - is not derived from a measurement and is left alone, so a 45 FPS game can still be pinned to 45 on purpose. Docked mode keeps its own allowlist.
+A rate set by hand - FPSLocker, or the legacy `SetDisplayRefreshRate` path NetherSX2 uses at startup - was never clamped and still is not. Docked mode keeps its own allowlist.
 
-Consequence worth knowing: a game that genuinely cannot fill 50 FPS gets a 50 Hz panel and the judder that implies. That is a deliberate trade - the alternative is a panel that silently camps at 45 and never comes back.
+Consequence worth knowing: a game that genuinely cannot fill 45 FPS gets a 45 Hz panel and the judder that implies.
 
-### A drop can lock itself in
+### A drop can lock itself in - and now gets out
 
 A drop is the only direction that can become permanent. The panel slows down, the compositor then paces the app at the new rate, the app measures that same rate and publishes it, and the loop has no way to tell a game that genuinely runs at 45 from a panel that dragged it down to 45. By the time the value is measured it is genuinely true, so the rate stays until it is set by hand. That is the failure users hit as "sync locked my game at 45 FPS and I have to turn it off and set 50 myself".
+
+Fine mode cannot tell the difference by looking, so it stops looking and starts testing. When the smoothed measurement has sat on the panel rate for fifteen seconds and the panel is below its maximum, the panel goes up one hertz. Then:
+
+| what happens next | what it means | what the sync does |
+| --- | --- | --- |
+| the measurement follows within six seconds | the panel was the limiter | stay, and test again fifteen seconds later |
+| the measurement does not follow | the app really runs at that rate | back down, park that rate for five minutes |
+
+The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end. A game that genuinely runs at 45 loses six seconds of every five minutes to a one-hertz excursion, which is the price of never being stuck.
+
+```
+SaltyNX: display-sync: testing 45 Hz against 46 Hz, which the app held before
+SaltyNX: display-sync: 45 Hz was not a lock, target followed to 46 Hz (active 46 Hz)
+```
+
+or
+
+```
+SaltyNX: display-sync: testing 45 Hz against 46 Hz, which the app held before
+SaltyNX: display-sync: 45 Hz is real, back from the test (target 45 Hz, active 45 Hz)
+```
+
+The client path keeps its own test - one excursion of five hertz, armed only when a change lands on the floor - because a 5 Hz ladder cannot express anything finer.
 
 A rise cannot get stuck that way, because the app can always correct it down. So the way out is to walk the panel back up once and watch what the app does:
 

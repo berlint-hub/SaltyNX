@@ -265,15 +265,15 @@ void checkIfDmntChtNeedsToBeActive() {
 #define REFRESH_RATE_DEADBAND_HZ   1u
 #define SV_TICKS_PER_MS        19200ULL
 
-// Display sync is not allowed to take the handheld panel below this. The client
-// derives its target from a measured cadence, so a slow scene publishes 45 - and once
-// the panel sits at 45 the loop cannot tell that from a game that really runs at 45,
-// because by then it does. 50/55/60 is the whole window this sync may use.
+// Display sync is not allowed to take the handheld panel below this. 45 Hz is the
+// OLED panel's own floor and the hardware limit the sweep in 2.1.20 measured: every
+// integer rate from 45 to 60 lands exactly, so there is no reason to keep the automatic
+// path out of 45..49 any more. The window this sync may use is 45..60, one hertz apart.
 //
-// A rate set by hand (FPSLocker, the legacy SetDisplayRefreshRate path) is not derived
-// from a measurement and is left alone, so a 45 FPS game can still be pinned to 45
-// deliberately - it just cannot drift there on its own.
-#define DISPLAY_SYNC_MIN_RATE 50u
+// Rates the client cannot express - anything outside its 5 Hz table, and anything
+// between whole hertz - come from the measured path, which is on by default since
+// 2.1.26. The clamp below only catches the client's own quantised target.
+#define DISPLAY_SYNC_MIN_RATE 45u
 
 static uint32_t pendingRefreshRate = 0;
 static u64 pendingRefreshSince = 0;
@@ -296,15 +296,36 @@ static u64 pendingRefreshRequired = 0;
 // "no target yet" must not, or every launch would probe away from its real rate.
 #define PROBE_HOLD_MS    10000ULL
 #define PROBE_WINDOW_MS  12000ULL
+// Fine mode has no way out of a lock on its own: the panel paces the app, the app
+// measures the panel, and "the game runs at 45" and "the panel is holding the game at
+// 45" produce the same number by construction. The only test that separates them is to
+// raise the panel and watch whether the measurement follows. Wait fifteen seconds of
+// agreement before suspecting it, then test 2 Hz up - two, not five, because one hertz
+// is the whole point of this path. One hertz, because a 2 Hz excursion overshoots: at a
+// 49 Hz panel the app lands on 50, the test wants 51, and the panel ends up one hertz
+// off with the app shorting frames.
+#define FINE_LOCK_SUSPECT_MS 15000ULL
+#define FINE_LOCK_STEP       1u
+// A successful test is followed by another one, so the panel climbs 45 -> 47 -> 49 -> 51
+// until the app stops following. A failed one parks that rate for five minutes; the
+// scene that could not do 52 at minute one may do it at minute six, and without a retry
+// the panel would never find out. The test itself lasts six seconds, not twelve - the
+// client publishes once a second and the average crosses 2 Hz in two or three samples.
+#define FINE_RETRY_MS        300000ULL
+#define FINE_PROBE_WINDOW_MS 6000ULL
 
 static bool probeArmed = false;      // last applied change went below the demonstrated max
 static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
 static uint32_t probeTarget = 0;
 static u64 probeStart = 0;
+static u64 probeWindowMs = PROBE_WINDOW_MS;
 static uint32_t probeFailedRate = 0;
+static u64 probeFailedSince = 0;
+static bool probeFromFine = false;   // this test came from the measured path
 static uint32_t probeCount = 0;      // capped, so a game wobbling on the boundary
 static const uint32_t probeLimit = 3; // cannot ping-pong the panel forever
 static u64 sameRateSince = 0;
+static u64 finePinnedSince = 0;
 static bool minRateClampLogged = false;
 
 // ---------------------------------------------------------------------------
@@ -349,13 +370,23 @@ static bool testSweepDone = false;
 // pointless once the target itself only moves by a hertz: a real one-hertz change is
 // followed in 4 s, a large swing still gets the 1.5 s treatment.
 #define FINE_SYNC_FILE "sdmc:/SaltySD/flags/sync_fine.flag"
+#define FINE_SYNC_OFF_FILE "sdmc:/SaltySD/flags/sync_fine_off.flag"
 
-static bool fineSyncEnabled = false;
+// On by default since 2.1.26. Without it the panel can only ever sit on the client's
+// 5 Hz table, which is not a smooth 45..60 window - and now that the floor is 45 there
+// is nothing left for it to protect. The flag file is still honoured so an install that
+// already has it keeps working, and a file next to it turns the path off again.
+static bool fineSyncEnabled = true;
 
 static void loadFineSyncFlag() {
-    fineSyncEnabled = file_or_directory_exists(FINE_SYNC_FILE);
-    if (fineSyncEnabled)
+    const bool off = file_or_directory_exists(FINE_SYNC_OFF_FILE);
+    if (file_or_directory_exists(FINE_SYNC_FILE))
         SaltyNX_printf(APP_NAME ": fine sync enabled from " FINE_SYNC_FILE ", following the measured rate to the hertz\n");
+    else if (off)
+        SaltyNX_printf(APP_NAME ": fine sync disabled by " FINE_SYNC_OFF_FILE ", the panel follows the client target only\n");
+    else
+        SaltyNX_printf(APP_NAME ": fine sync enabled by default, following the measured rate to the hertz\n");
+    fineSyncEnabled = !off;
 }
 
 // A client publishes FPSavg as a whole number, once a second, from a window of
@@ -515,8 +546,12 @@ void cleanAppData() {
     probeFromRate = 0;
     probeTarget = 0;
     probeFailedRate = 0;
+    probeFailedSince = 0;
+    probeFromFine = false;
+    probeWindowMs = PROBE_WINDOW_MS;
     probeCount = 0;
     sameRateSince = 0;
+    finePinnedSince = 0;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;
@@ -627,23 +662,29 @@ void updateRefreshRateForApp() {
             // The target only counts as followed if it comes back to the rate being
             // tested - "it moved up somehow" is not the same thing, and 2.1.19 read a
             // target of 55 at 60 Hz as proof that 50 had been the panel's ceiling.
-            if (check_refresh_rate + 1 >= probeTarget) {
+            // The client path quantises to 5 Hz, so one hertz of slack there; the
+            // measured path does not, and a panel one hertz above what the app can fill
+            // is a judder the test itself created.
+            if (check_refresh_rate + (probeFromFine ? 0u : 1u) >= probeTarget) {
                 uint32_t achieved = 0;
                 if (GetDisplayRefreshRate(&achieved, true))
-                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was the ceiling, target followed to %u Hz (active %u Hz)\n",
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was not a lock, target followed to %u Hz (active %u Hz)\n",
                                    probeFromRate, check_refresh_rate, achieved);
                 else
-                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was the ceiling, target followed to %u Hz\n",
+                    SaltyNX_printf(APP_NAME ": display-sync: %u Hz was not a lock, target followed to %u Hz\n",
                                    probeFromRate, check_refresh_rate);
                 probeFromRate = 0;
                 probeArmed = false;
+                probeFromFine = false;
+                probeTarget = 0;
                 sameRateSince = 0;
                 pendingRefreshRate = 0;
             }
-            else if (check_refresh_rate < probeFromRate || now - probeStart >= PROBE_WINDOW_MS * SV_TICKS_PER_MS) {
+            else if (check_refresh_rate < probeFromRate || now - probeStart >= probeWindowMs * SV_TICKS_PER_MS) {
                 uint32_t achieved = 0;
                 SetDisplayRefreshRate(probeFromRate);
                 probeFailedRate = probeFromRate;
+                probeFailedSince = now;
                 if (GetDisplayRefreshRate(&achieved, true))
                     SaltyNX_printf(APP_NAME ": display-sync: %u Hz is real, back from the test (target %u Hz, active %u Hz)\n",
                                    probeFromRate, check_refresh_rate, achieved);
@@ -652,6 +693,8 @@ void updateRefreshRateForApp() {
                                    probeFromRate, check_refresh_rate);
                 probeFromRate = 0;
                 probeArmed = false;
+                probeFromFine = false;
+                probeTarget = 0;
                 sameRateSince = now;
                 pendingRefreshRate = 0;
             }
@@ -725,15 +768,43 @@ void updateRefreshRateForApp() {
                     if (up > HandheldModeRefreshRateAllowed.max)
                         up = HandheldModeRefreshRateAllowed.max;
                     probeTarget = up;
+                    probeFromFine = false;
+                    probeWindowMs = PROBE_WINDOW_MS;
                 }
             }
         }
         else {
             pendingRefreshRate = 0;
+            // Ambiguous only when the smoothed measurement sits on the panel rate: a
+            // 42 next to a 45 Hz panel is the app being the limiter and there is
+            // nothing to prove. Agreement for fifteen seconds is the lock shape.
+            const float agree = fineAvg - (float)temp_refreshRate;
+            const bool measurementOnPanel = fineAvgValid && agree < 0.6f && agree > -0.6f;
+            if (fineRate && measurementOnPanel && temp_refreshRate < HandheldModeRefreshRateAllowed.max &&
+                !probeFromRate) {
+                if (finePinnedSince == 0)
+                    finePinnedSince = now;
+                const bool parked = (temp_refreshRate == probeFailedRate) &&
+                                    (now - probeFailedSince < FINE_RETRY_MS * SV_TICKS_PER_MS);
+                if (!probeArmed && !parked &&
+                    now - finePinnedSince >= FINE_LOCK_SUSPECT_MS * SV_TICKS_PER_MS)
+                    probeArmed = true;
+                if (probeArmed && probeTarget == 0) {
+                    uint32_t up = temp_refreshRate + FINE_LOCK_STEP;
+                    if (up > HandheldModeRefreshRateAllowed.max)
+                        up = HandheldModeRefreshRateAllowed.max;
+                    probeTarget = up;
+                    probeFromFine = true;
+                    probeWindowMs = FINE_PROBE_WINDOW_MS;
+                }
+            }
+            else if (!measurementOnPanel) {
+                finePinnedSince = 0;
+            }
             if (probeArmed && probeTarget > check_refresh_rate) {
                 if (sameRateSince == 0)
                     sameRateSince = now;
-                else if (now - sameRateSince >= PROBE_HOLD_MS * SV_TICKS_PER_MS) {
+                else if (now - sameRateSince >= (probeFromFine ? 0ULL : PROBE_HOLD_MS) * SV_TICKS_PER_MS) {
                     uint32_t up = (probeTarget > HandheldModeRefreshRateAllowed.max)
                                 ? HandheldModeRefreshRateAllowed.max
                                 : probeTarget;
@@ -741,7 +812,8 @@ void updateRefreshRateForApp() {
                     probeFromRate = check_refresh_rate;
                     probeStart = now;
                     sameRateSince = 0;
-                    probeCount++;
+                    if (!probeFromFine)
+                        probeCount++;
                     SetDisplayRefreshRate(up);
                     SaltyNX_printf(APP_NAME ": display-sync: testing %u Hz against %u Hz, which the app held before\n",
                                    check_refresh_rate, up);
