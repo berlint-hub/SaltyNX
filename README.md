@@ -303,6 +303,29 @@ The remaining three seconds are `FINE_REJECT_MS` and nothing else. That is the d
 
 **One thing still cannot be tracked, and it is worth being clear about.** Under vsync the panel paces the app, so an app held at 47 measures 47 whether it could do 50 or not - the signal that would justify a rise does not exist in the measurement. Rising therefore cannot be inferred, only tested: after eight seconds of the measurement agreeing with the panel, the loop raises it one hertz for six seconds and watches. If the app follows, the panel stays; if not, that rate is parked. Eight seconds instead of fifteen is the only change here, and it makes the discovery faster without changing how often a wrong guess is retried.
 
+### Who does what: SaltyNX, the Core, and FPSLocker
+
+These three are constantly mistaken for alternatives. They are a stack, and the confusion costs people a whole evening every time, because the missing piece is the one nobody installs separately.
+
+| piece | what it is | what it actually does |
+|---|---|---|
+| **SaltyNX** (`exefs.nsp`, a sysmodule) | the mechanism | hijacks the game's process, owns the shared memory, serves the IPC, and performs the rate change itself (`SetDisplayRefreshRate`, two PLLD register writes) |
+| **the Core** (`saltynx_core.elf`, injected into the game) | the instrumentation | creates the NX-FPS block, counts presents, publishes `FPS` / `FPSavg`, implements the buffer and FPS-target settings |
+| **FPSLocker** (a Tesla overlay) | the user interface | reads that block, writes `FPSlocked` / `Buffers` into it, and calls the SaltyNX IPC |
+
+The line worth remembering: **the overlay has no measuring code of its own.** FPSLocker finds the block by the same magic, `0x465053`, that this sysmodule scans its shared memory for, and it refuses to draw its real menu until `pluginActive` is set. No Core, no block, no `pluginActive` - and the overlay correctly shows "NX-FPS is not running" instead of a menu.
+
+That is the state the log shows. `fine: block=missing` is this sysmodule looking for `0x465053` in its own shared memory and not finding it, which means no Core ever initialised inside the game. Fine mode then has nothing to follow, and FPSLocker has nothing to display. The two symptoms are the same cause, seen from two processes.
+
+The Core is not a separate download - it is built from this repository and must be present as `sdmc:/SaltySD/saltynx_core.elf`, next to `sdmc:/SaltySD/saltynx_bootstrap.elf`, and both must come from the same release as the `.nsp`. Installing only `exefs.nsp`, which is the natural thing to do when the only file that changes between builds is the size of the sysmodule, leaves the Core at whatever version was there before - or absent on a first install. Since 2.1.38 the sysmodule says which of the two it found at boot:
+
+```
+SaltyNX: saltynx_core.elf present, 197592 B
+SaltyNX: saltynx_bootstrap.elf is MISSING - games will start without SaltyNX and nothing will measure a frame rate
+```
+
+One more line in that log needs translating, because it looks alarming and is not. `no client on port NethFPS yet` is about the *emulator*: NetherSX2 connects to a private endpoint of this fork and publishes its own `FPSavg` there. A native game never connects to it, so the line is expected background noise in a native-game log and has nothing to do with NX-FPS.
+
 ### FPSLocker, or this? They answer different questions
 
 FPSLocker is an overlay that sets a target. This is a loop that follows one. The distinction sounds academic until it meets a game whose frame rate wanders, which is most of them.

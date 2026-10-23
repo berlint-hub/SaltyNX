@@ -411,6 +411,31 @@ static bool testSweepDone = false;
 // already has it keeps working, and a file next to it turns the path off again.
 static bool fineSyncEnabled = true;
 
+// The sysmodule is only half of SaltyNX. The other half is two files on the SD card that
+// get injected into the game: the bootstrap, and the core. The core is what creates the
+// NX-FPS block, and everything that reads a frame rate - fine mode here, and the whole of
+// FPSLocker's overlay - is blind without it. When it is missing the only symptom is
+// "plugin isn't running" from an overlay that has no way to say why, so say it here, once,
+// at boot, where it costs one line.
+static void checkInjectedFiles() {
+    static const char* const files[] = {
+        "sdmc:/SaltySD/saltynx_bootstrap.elf",
+        "sdmc:/SaltySD/saltynx_core.elf",
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        FILE* f = fopen(files[i], "rb");
+        if (!f) {
+            SaltyNX_printf(APP_NAME ": %s is MISSING - games will start without SaltyNX "
+                           "and nothing will measure a frame rate\n", files[i] + 14);
+            continue;
+        }
+        fseek(f, 0, 2);
+        const long size = ftell(f);
+        fclose(f);
+        SaltyNX_printf(APP_NAME ": %s present, %ld B\n", files[i] + 14, size);
+    }
+}
+
 static void loadFineSyncFlag() {
     const bool off = file_or_directory_exists(FINE_SYNC_OFF_FILE);
     if (file_or_directory_exists(FINE_SYNC_FILE))
@@ -1237,6 +1262,7 @@ void Initialize() {
         SaltyNX_printf(APP_NAME ": logging is opt-in: log.flag writes decisions, log.full.flag adds the IPC trace\n");
     loadTestSweep();
     loadFineSyncFlag();
+    checkInjectedFiles();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);
