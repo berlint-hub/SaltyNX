@@ -27,21 +27,30 @@ extern "C" {
 		SaltySDCore_printf("NX-FPS: found main at: 0x%lX\n", LOCK::patcher.mainRegion());
 
 		/* A zero here means the code-region scan did not find this process's executable
-		 * segment. Everything below this line assumes it did: the patcher's write base is
-		 * literally main_start + offset, and the present hooks decide where to write by
-		 * comparing against it. Installing them on a null region turns "I do not
-		 * understand this process" into writes to an address the game never mapped, which
-		 * the kernel reports as an application that had to close.
+		 * segment. Only one half of NX-FPS needs it, and the two halves are separable:
 		 *
-		 * So this is a refusal, not a warning. The game runs with no NX-FPS - no frame
-		 * counting, no FPSLocker menu, no fine mode - which is a far better outcome than
-		 * the alternative, and the log says which one happened.
+		 *   - The patcher writes FPS targets into the game's code, at literally
+		 *     main_start + offset. With a null region that is a write to an address the
+		 *     game never mapped, which the kernel reports as an application that had to
+		 *     close. It must not run.
+		 *   - Frame measurement does not touch main_start at all. It counts presents in
+		 *     the hooked swap/present calls, which is where FPS, FPSavg and pluginActive
+		 *     come from - the three fields FPSLocker's menu and this sysmodule's fine mode
+		 *     actually consume.
+		 *
+		 * Refusing both, which is what 2.1.43 did, threw away the half that works. So a
+		 * missing region now disables the patcher and keeps the instrument, and the log
+		 * says exactly that rather than leaving "NX-FPS is not running" to be interpreted.
+		 *
+		 * Keeping the patcher off is automatic rather than asserted: configRC starts at 1
+		 * and only becomes 0 when a patch file loads, and the only thing that clears it is
+		 * the load below, which is skipped. applyPatch is therefore never reached.
 		 */
-		if (!LOCK::patcher.mainRegion()) {
-			SaltySDCore_printf("NX-FPS: no executable main region found, refusing to inject - "
-			                   "the game will run without NX-FPS. Add this title to "
+		const bool patcherDisabled = (LOCK::patcher.mainRegion() == 0);
+		if (patcherDisabled) {
+			SaltySDCore_printf("NX-FPS: no executable main region found - measuring frames, "
+			                   "but FPS targets cannot be applied to this title. Add it to "
 			                   "exceptions.txt to have SaltyNX leave it alone entirely\n");
-			return;
 		}
 		Result ret = SaltySD_CheckIfSharedMemoryAvailable(&SharedMemoryOffset, sizeof(NxFpsSharedBlock));
 		SaltySDCore_printf("NX-FPS: ret: 0x%X\n", ret);
@@ -185,7 +194,11 @@ extern "C" {
 
 			u64 buildid = SaltySD_GetBID();
 			if (!buildid) {
-				SaltySDCore_printf("NX-FPS: getBID failed! Err: 0x%x\n", ret);
+				// Previously printed `ret`, which belonged to the shared-memory call above and
+				// was therefore always 0 here - an error code that could never be anything.
+				// There is no patch to find without a build ID, so say that and move on.
+				SaltySDCore_printf("NX-FPS: getBID failed, no build ID for this process - "
+				                   "FPSLocker patches cannot be matched, measuring anyway\n");
 			}
 			else {
 				#if defined(SWITCH32) || defined(OUNCE32)
@@ -195,7 +208,8 @@ extern "C" {
 				npf_snprintf(path, sizeof(path), "sdmc:/SaltySD/plugins/FPSLocker/patches/%016lX/%016lX.bin", titleid, buildid);
 				SaltySDCore_printf("NX-FPS: BID: %016lX\n", buildid);
 				#endif
-				FILE* patch_file = SaltySDCore_fopen(path, "rb");
+				FILE* patch_file = NULL;
+				if (!patcherDisabled) patch_file = SaltySDCore_fopen(path, "rb");
 				if (patch_file) {
 					SaltySDCore_fclose(patch_file);
 					SaltySDCore_printf("NX-FPS: FPSLocker: successfully opened: %s\n", path);
@@ -218,7 +232,7 @@ extern "C" {
 					}
 
 				}
-				else SaltySDCore_printf("NX-FPS: FPSLocker: File not found: %s\n", path);
+				else if (!patcherDisabled) SaltySDCore_printf("NX-FPS: FPSLocker: File not found: %s\n", path);
 			}
 		}
 		SaltySDCore_printf("NX-FPS: injection finished\n");

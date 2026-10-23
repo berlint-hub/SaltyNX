@@ -351,7 +351,7 @@ Since 2.1.39 the 30 second status line carries `plugin=`, and the 30 second "no 
 
 Worth knowing while comparing titles: NetherSX2 reports the first state as *working*. It publishes into the same block, but it finds the block rather than creating it - the Core still has to run and build it. So an emulator that measures correctly proves the Core loaded, and says nothing about whether NX-FPS's own present hook fires.
 
-### NX-FPS refuses to inject when it cannot find the game's code
+### NX-FPS measures even when it cannot find the game's code
 
 The sysmodule loads the Core by reading `saltynx_core.elf` from the SD card, and 2.1.42 made that read reliable. Which immediately exposed the next thing in the queue: some titles now get a Core that then installs hooks it has no business installing.
 
@@ -366,7 +366,7 @@ SaltyNX Core: getBID failed!
 
 Carrying on is the bug. The patcher's write base is literally `m_mappings.main_start + header.main_offset`, and the present hooks resolve their targets relative to the same value. With a null base, "I do not understand this process" becomes a write to an address the game never mapped, and the kernel reports that as *the application had to close*.
 
-Since 2.1.43 that state is a refusal, not a warning:
+2.1.43 refused to inject at all, which stopped the crashes and cost the frame counter:
 
 ```
 NX-FPS: no executable main region found, refusing to inject - the game will run
@@ -374,7 +374,24 @@ NX-FPS: no executable main region found, refusing to inject - the game will run
          alone entirely
 ```
 
-The game runs. There is no frame counting, no FPSLocker menu and no fine mode for that title, which is a much better outcome than a dialog and a trip back to the home screen. The sysmodule's own log repeats this line through the Core's-last-words mechanism, so it is one file to look at.
+That was half a fix. Of the two halves of NX-FPS, only one needs the region:
+
+| | needs `main_start` | what it produces |
+|---|---|---|
+| patcher (`applyPatch`) | yes - its write base is `main_start + offset` | FPS targets, FPSLocker's menu actually changing the rate |
+| frame counter (present hooks) | no - it counts presents as they happen | `FPS`, `FPSavg`, `pluginActive`, fine mode |
+
+So since 2.1.44 a missing region disables the patcher and keeps the instrument:
+
+```
+NX-FPS: no executable main region found - measuring frames, but FPS targets cannot
+        be applied to this title. Add it to exceptions.txt to have SaltyNX leave it
+        alone entirely
+```
+
+`pluginActive` is set by the present hook, not by this sysmodule, and FPSLocker gates its whole menu on it - which is why the refusal showed up there as "NX-FPS not running" even though the Core had clearly run. With the block initialised, FPSLocker sees live FPS for such a title. What it cannot do there is *apply* a target, because no patch can ever be loaded: the patch path contains the build ID, and this title reports none.
+
+The patcher is kept off structurally rather than by a guard: `configRC` starts at 1 and only becomes 0 when a patch file loads, and the load is skipped when the region is missing. `applyPatch` is therefore never reached - it has no null-base check of its own, and adding one would only hide the state that has to be visible anyway.
 
 **`sdmc:/SaltySD/flags/nofps.flag`** does the same thing deliberately, without the diagnosis: NX-FPS does not inject, everything else in the Core still runs. It is there for answering "is NX-FPS the half that crashes this game" without removing SaltyNX entirely - which is what `exceptions.txt` does, and which tells you nothing about the cause.
 
@@ -405,7 +422,7 @@ Either way the report is identical, and both come from one unchecked read.
 | Core read | one `fread`, result discarded | five attempts, 100 ms apart, result checked |
 | short read | garbage parsed as ELF | retried, then a clean refusal |
 | failure | game terminated from inside itself | nothing half-written into the process |
-| bootstrap ELF read | one attempt, aborts the hijack | three attempts |
+| bootstrap ELF read | one attempt, aborts the hijack | read once at boot, kept in RAM; three attempts remain as a fallback |
 | port wait in the bootstrap | infinite | 10 s, then a logged give-up |
 
 The bootstrap's wait for the sysmodule was `do { connect } while (failed)` with no limit at all - a game that never starts and never says why. It is now bounded and says so through `svcOutputDebugString`.
@@ -413,6 +430,19 @@ The bootstrap's wait for the sysmodule was `do { connect } while (failed)` with 
 ### Why the emulator-first trick worked
 
 Nothing about NetherSX2 made native games work. It touched the SD card, and the next read from a card that had been idle since boot succeeded. Anything that reads from `sdmc:` first would have done the same, which is why the fix is a retry and not a special case for the emulator.
+
+Retries alone were not enough, because the read happened at the worst possible moment: inside the hijack, with the game already suspended at its entry point, where every retry is a second of black screen. The failure needs seconds to clear, and the budget there is one or two.
+
+So 2.1.44 moves the read to boot. The sysmodule reads `saltynx_bootstrap.elf` into RAM once, with ten tries 300 ms apart, and every launch after that uses the copy - the SD card is not touched for it again, which is what removes the ritual rather than merely shortening it. If the boot read fails after all ten, the per-launch path is unchanged and still tries three times, so nothing gets worse.
+
+The copy is from the boot at which it was read, so replacing `saltynx_bootstrap.elf` on the card takes effect after the reboot that installing it requires anyway. `saltynx_core.elf` is still read per launch and is not cached.
+
+The byte count in that message was printed with `%zu` until 2.1.44, and this printf does not implement it - the number came out as the literal text `%zu`, so the one value that explains the failure never appeared in a log. It is `%u` now, and it reports how many bytes actually arrived:
+
+```
+SaltyNX: couldn't read SaltySD/saltynx_bootstrap.elf after 3 attempts
+         (8192 B of 28616 requested), aborting...
+```
 
 ### Who does what: SaltyNX, the Core, and FPSLocker
 

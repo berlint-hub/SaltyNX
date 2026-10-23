@@ -85,6 +85,27 @@ jobs:
             sdcard_out/atmosphere/contents/0000000000534C56/toolbox.json \
             || { echo "::error::toolbox.json version does not match version.mk"; exit 1; }
           say "toolbox.json version matches"
+          for marker in "bootstrap cached at boot" "could not cache the bootstrap at boot"; do
+            if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
+              say "proc marker present: $marker"
+            else
+              echo "::error::marker missing from saltynx_proc.elf: $marker"
+              exit 1
+            fi
+          done
+          # The unsupported conversion specifier that hid the byte count in the user's log.
+          if grep -aqF "B of %u requested" saltysd_proc/saltynx_proc.elf; then
+            say "proc marker present: B of %u requested"
+          else
+            echo "::error::byte-count message missing from saltynx_proc.elf"
+            exit 1
+          fi
+          # A warning, not a failure: library code may legitimately carry the literal.
+          if grep -aqF "%zu" saltysd_proc/saltynx_proc.elf; then
+            say "note: saltynx_proc.elf still contains a literal %zu somewhere"
+          else
+            say "no %zu left in saltynx_proc.elf"
+          fi
           for marker in "display-sync endpoint ready" "waiting for a client on port" \
                         "no client on port" "client PID" "session #" \
                         "hides the command id" \
@@ -135,7 +156,8 @@ jobs:
               exit 1
             fi
           done
-          for marker in "session limit" "no executable main region found" "disabled by nofps.flag"; do
+          for marker in "session limit" "no executable main region found" "measuring frames" \
+                        "disabled by nofps.flag"; do
             if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
               say "core marker present: $marker"
             else

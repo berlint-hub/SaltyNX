@@ -497,6 +497,72 @@ static void checkInjectedFiles() {
     }
 }
 
+// The bootstrap ELF, read once at boot and kept for every launch.
+//
+// Per launch this file used to be read from the SD card inside hijack_bootstrap(), with
+// the game suspended at its entry point and the whole launch depending on one fread. On a
+// card that has been idle since power-on that read comes back short often enough to be the
+// first thing anyone notices - "the first game after a reboot does not start, launch the
+// emulator first and it works". Retrying inside the hijack helps only a little, because
+// every retry is a second of black screen and the failure needs seconds to clear.
+//
+// At boot nothing is waiting. A few seconds of retries here are invisible, and after this
+// succeeds the file is never touched again - which is also why the emulator-first ritual
+// stops being necessary rather than merely less necessary.
+static u8* g_bootstrapElf = NULL;
+static size_t g_bootstrapElfSize = 0;
+
+// Declared in shared.h for hijack.c; repeated here so this file's definition is checked
+// against it by the compiler rather than at link time.
+bool getBootstrappedElf(u8** buf, size_t* size);
+
+bool getBootstrappedElf(u8** buf, size_t* size) {
+    if (!g_bootstrapElf || !g_bootstrapElfSize)
+        return false;
+    *buf = g_bootstrapElf;
+    *size = g_bootstrapElfSize;
+    return true;
+}
+
+// Ten tries, 300 ms apart: three seconds, once, at boot. A short read leaves part of the
+// buffer unwritten, so the attempt is discarded whole and started again rather than
+// trusting a partial result.
+void preloadBootstrap() {
+    for (unsigned attempt = 0; attempt < 10 && !g_bootstrapElf; attempt++) {
+        if (attempt)
+            svcSleepThread(300ull * 1000 * 1000);
+        FILE* f = fopen("sdmc:/SaltySD/saltynx_bootstrap.elf", "rb");
+        if (!f)
+            continue;
+        fseek(f, 0, 2);
+        const long size = ftell(f);
+        fseek(f, 0, 0);
+        if (size <= 0 || size > 0x100000) {
+            fclose(f);
+            continue;
+        }
+        u8* buf = malloc((size_t)size);
+        if (!buf) {
+            fclose(f);
+            break;
+        }
+        const size_t got = fread(buf, 1, (size_t)size, f);
+        fclose(f);
+        if (got == (size_t)size) {
+            g_bootstrapElf = buf;
+            g_bootstrapElfSize = (size_t)size;
+        }
+        else {
+            free(buf);
+        }
+    }
+    if (g_bootstrapElf)
+        SaltyNX_printf(APP_NAME ": bootstrap cached at boot (%u B), games will not touch the SD for it\n",
+                       (unsigned)g_bootstrapElfSize);
+    else
+        SaltyNX_printf(APP_NAME ": could not cache the bootstrap at boot, each launch will read it from the SD\n");
+}
+
 static void loadFineSyncFlag() {
     const bool off = file_or_directory_exists(FINE_SYNC_OFF_FILE);
     if (file_or_directory_exists(FINE_SYNC_FILE))
@@ -1422,6 +1488,7 @@ void Initialize() {
     loadTestSweep();
     loadFineSyncFlag();
     checkInjectedFiles();
+    preloadBootstrap();
 
     
     ABORT_IF_FAILED(setsysInitialize(), 10);
