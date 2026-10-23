@@ -546,6 +546,47 @@ static void fineSampleMeasurement() {
         finePeak = fineAvg;
 }
 
+// Content slower than the panel floor cannot be matched one to one, and clamping it to
+// the floor is the worst answer available. A 30 fps game on a 45 Hz panel is a 1.5:1
+// ratio: one frame shown for two refreshes and the next for one, forever. That is a
+// hitch on every single frame - worse than not syncing at all.
+//
+// A whole multiple is what a VRR display reaches for when it cannot match, and it is
+// what the hardware here can actually do: 30 fps on 60 Hz shows every frame for exactly
+// two refreshes, so the cadence is even even though the ratio is not 1:1.
+//
+// The multiple is taken from the snapped content rate rather than the raw measurement,
+// and that is the whole trick. A 30 fps game measures 28.6 during a busy scene, and
+// 2 x 28.6 is 57 Hz - a 1.9:1 ratio, worse than the floor it replaced. 2 x 30 is 60.
+// Games lock to a handful of rates, so snapping within two hertz is safe and it makes
+// the answer stable without any hysteresis of its own: 28.6 and 31.0 both snap to 30.
+static const uint8_t kFineMultipleContent[] = {15, 20, 24, 25, 30, 40, 50, 60};
+
+static uint32_t fineMultipleTarget(float avg) {
+    uint32_t content = 0;
+    float best = 2.01f;
+    for (size_t i = 0; i < sizeof(kFineMultipleContent); i++) {
+        const float rate = (float)kFineMultipleContent[i];
+        const float d = avg > rate ? avg - rate : rate - avg;
+        if (d < best) {
+            best = d;
+            content = kFineMultipleContent[i];
+        }
+    }
+    if (!content)
+        return HandheldModeRefreshRateAllowed.min;
+    for (uint32_t k = 2; k <= 4; k++) {
+        const uint32_t panel = content * k;
+        if (panel >= HandheldModeRefreshRateAllowed.min &&
+            panel <= HandheldModeRefreshRateAllowed.max)
+            return panel;
+    }
+    // 30..45 fps has no usable multiple: 2x is above the ceiling and 1x is below the
+    // floor. The floor is then the best ratio on offer, and near the top of that band it
+    // is only a hair above 1:1, so this is not the disaster the plain clamp was.
+    return HandheldModeRefreshRateAllowed.min;
+}
+
 // Returns 0 when there is nothing trustworthy to follow.
 static uint32_t fineMeasuredTarget() {
     if (!fineAvgValid) {
@@ -557,16 +598,20 @@ static uint32_t fineMeasuredTarget() {
         return 0;
     }
     const float avg = fineAvg;
+    // Below the floor the target is a multiple of the content, not the content itself,
+    // so the deadband below has nothing to compare against and fineMultipleTarget does
+    // its own hysteresis in content space.
+    const bool belowFloor = avg < (float)HandheldModeRefreshRateAllowed.min;
     uint32_t target = (uint32_t)(avg + 0.5f);
-    if (target < HandheldModeRefreshRateAllowed.min)
-        target = HandheldModeRefreshRateAllowed.min;
+    if (belowFloor)
+        target = fineMultipleTarget(avg);
     else if (target > HandheldModeRefreshRateAllowed.max)
         target = HandheldModeRefreshRateAllowed.max;
     // Stay where we are while the measurement is still grazing the rate we already
     // asked for. Without this a smoothed 48.9 rounds to 49, drops the panel, and the
     // next sample rounds back to 50 - a mode switch every few seconds that looks
     // exactly like the judder it was supposed to remove.
-    if (fineTarget && target != fineTarget) {
+    if (!belowFloor && fineTarget && target != fineTarget) {
         const float delta = avg - (float)fineTarget;
         if (delta < 0.0f) {
             if (delta > -FINE_TARGET_FALL)

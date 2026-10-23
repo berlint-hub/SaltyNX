@@ -249,6 +249,35 @@ The fine target may not climb past the panel on a one hertz measurement. The cli
 
 The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
+### Native games, and how close this really gets to VRR
+
+Nothing in fine mode is emulator-specific. It follows whatever publishes `FPSavg` into the NX-FPS block, and for a native game that is NX-FPS itself, hooking the game's own present path. The emulator needed a handoff only because its Vulkan wrapper resolves `vkQueuePresentKHR` at runtime, so NX-FPS's hook is never called; a native game has no such problem. Turn on display sync and it works, with no flag files and no per-game setup.
+
+There was one thing wrong with that, and it mattered for almost every native title.
+
+**A 30 fps game used to be sent to 45 Hz.** The floor is a floor, so content below it was clamped to it, and 30 fps against 45 Hz is a 1.5:1 ratio - one frame shown for two refreshes and the next for one, forever. That is a hitch on *every frame*, which is worse than not syncing at all. Sixty hertz shows each frame for exactly two refreshes; that is the correct answer and it is the one a VRR display reaches for when it cannot match the content.
+
+The target for sub-floor content is now a whole multiple of the content rate, taken from a snapped rate rather than the raw measurement - a 30 fps game measures 28.6 during a busy scene and 2 x 28.6 is 57 Hz, which is a 1.9:1 ratio and worse than the floor it replaced. Games lock to a handful of rates, so the value is snapped within two hertz first and the multiple is stable without any hysteresis of its own.
+
+| content | panel | ratio |
+|---|---|---|
+| 60 fps | 60 Hz | 1:1 |
+| 50 fps | 50 Hz | 1:1 |
+| 47 fps | 47 Hz | 1:1 |
+| 30 fps | **60 Hz** | 2:1, every frame twice |
+| 25 fps | 50 Hz | 2:1 |
+| 24 fps | 48 Hz | 2:1 |
+| 20 fps | 60 Hz | 3:1 |
+| 15 fps | 45 Hz | 3:1 |
+| 43 fps | 45 Hz | 1.05:1 |
+| 40 fps | 45 Hz | 1.125:1 |
+
+The last two rows are where the range runs out. Between 30 and 45 fps there is no usable multiple - twice the content is above the ceiling and the content itself is below the floor - so the floor is the best ratio on offer. That is still far better than the plain clamp was: 43 fps against 45 Hz is 1.05:1, one frame in twenty repeated, not half of them.
+
+**This is not VRR, and the difference is the actuator.** A VRR panel changes its refresh timing continuously and for free. Here every change is a full mode switch - PLLD and nvdisp reprogrammed, the panel blanked briefly - so it costs tens of milliseconds and is plainly visible. That single fact explains the shape of everything in this document: the one hertz deadband, the four second hold, the two hertz rise band, the parking backoff, the whole distinction between an excursion and a settled rate. They are all there because the actuator is discrete, slow and expensive, not because the measurement is bad.
+
+What that buys is worth stating plainly. A 60 fps game sits at 60 and never moves. A 30 fps game sits at 60 with perfect 2:1 cadence. A game whose rate genuinely wanders gets a panel that follows it, a few hertz at a time, with a mode switch each time it moves. What it does not give is a panel that tracks frame by frame.
+
 ### FPSLocker, or this? They answer different questions
 
 FPSLocker is an overlay that sets a target. This is a loop that follows one. The distinction sounds academic until it meets a game whose frame rate wanders, which is most of them.
