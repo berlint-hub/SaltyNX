@@ -11,8 +11,38 @@ extern "C" {
 
 		sharedOperationMode = _sharedOperationMode;
 		SaltySDCore_printf("NX-FPS: alive\n");
+
+		/* Opt-out that leaves the rest of the Core alone: patches, ReverseNX and the
+		 * sysmodule's own work all still run, only NX-FPS does not inject. It exists
+		 * because "the game crashes and I do not know which half did it" is otherwise
+		 * answered by removing SaltyNX entirely, which then tells you nothing. */
+		FILE* nofps = SaltySDCore_fopen("sdmc:/SaltySD/flags/nofps.flag", "rb");
+		if (nofps) {
+			SaltySDCore_fclose(nofps);
+			SaltySDCore_printf("NX-FPS: disabled by nofps.flag, not injecting\n");
+			return;
+		}
+
 		LOCK::patcher.bindMainRegion(Utils::getMainAddress());
 		SaltySDCore_printf("NX-FPS: found main at: 0x%lX\n", LOCK::patcher.mainRegion());
+
+		/* A zero here means the code-region scan did not find this process's executable
+		 * segment. Everything below this line assumes it did: the patcher's write base is
+		 * literally main_start + offset, and the present hooks decide where to write by
+		 * comparing against it. Installing them on a null region turns "I do not
+		 * understand this process" into writes to an address the game never mapped, which
+		 * the kernel reports as an application that had to close.
+		 *
+		 * So this is a refusal, not a warning. The game runs with no NX-FPS - no frame
+		 * counting, no FPSLocker menu, no fine mode - which is a far better outcome than
+		 * the alternative, and the log says which one happened.
+		 */
+		if (!LOCK::patcher.mainRegion()) {
+			SaltySDCore_printf("NX-FPS: no executable main region found, refusing to inject - "
+			                   "the game will run without NX-FPS. Add this title to "
+			                   "exceptions.txt to have SaltyNX leave it alone entirely\n");
+			return;
+		}
 		Result ret = SaltySD_CheckIfSharedMemoryAvailable(&SharedMemoryOffset, sizeof(NxFpsSharedBlock));
 		SaltySDCore_printf("NX-FPS: ret: 0x%X\n", ret);
 		if (!ret) {

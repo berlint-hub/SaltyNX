@@ -351,6 +351,37 @@ Since 2.1.39 the 30 second status line carries `plugin=`, and the 30 second "no 
 
 Worth knowing while comparing titles: NetherSX2 reports the first state as *working*. It publishes into the same block, but it finds the block rather than creating it - the Core still has to run and build it. So an emulator that measures correctly proves the Core loaded, and says nothing about whether NX-FPS's own present hook fires.
 
+### NX-FPS refuses to inject when it cannot find the game's code
+
+The sysmodule loads the Core by reading `saltynx_core.elf` from the SD card, and 2.1.42 made that read reliable. Which immediately exposed the next thing in the queue: some titles now get a Core that then installs hooks it has no business installing.
+
+The evidence is two lines from the Core, in the middle of an otherwise healthy injection:
+
+```
+NX-FPS: found main at: 0x0
+SaltyNX Core: getBID failed!
+```
+
+`Utils::getMainAddress()` walks the process's memory looking for the executable region that belongs to the game. For a handful of titles it does not find it and returns 0 - the scan starts at a guessed code start and gives up after three regions. Upstream carried on regardless.
+
+Carrying on is the bug. The patcher's write base is literally `m_mappings.main_start + header.main_offset`, and the present hooks resolve their targets relative to the same value. With a null base, "I do not understand this process" becomes a write to an address the game never mapped, and the kernel reports that as *the application had to close*.
+
+Since 2.1.43 that state is a refusal, not a warning:
+
+```
+NX-FPS: no executable main region found, refusing to inject - the game will run
+         without NX-FPS. Add this title to exceptions.txt to have SaltyNX leave it
+         alone entirely
+```
+
+The game runs. There is no frame counting, no FPSLocker menu and no fine mode for that title, which is a much better outcome than a dialog and a trip back to the home screen. The sysmodule's own log repeats this line through the Core's-last-words mechanism, so it is one file to look at.
+
+**`sdmc:/SaltySD/flags/nofps.flag`** does the same thing deliberately, without the diagnosis: NX-FPS does not inject, everything else in the Core still runs. It is there for answering "is NX-FPS the half that crashes this game" without removing SaltyNX entirely - which is what `exceptions.txt` does, and which tells you nothing about the cause.
+
+### What the crash log actually showed
+
+Two complete Core initialisations appear back to back, the second reporting `session limit 32 -> 32` where a fresh process would report `1 -> 32`. Either the same process initialised the Core twice, or two launches shared a resource-limit object. Both are worth watching, and neither is something the sysmodule can rule out from its side - but the refusal above means the second one can no longer turn into a crash before anyone notices.
+
 ### The first game after a reboot crashed. So did the second, if you were unlucky.
 
 Reported as: reboot, launch a native game, "the application had to close", straight back to the menu. Launch NetherSX2 first, quit it, and every native game then works until the next reboot.

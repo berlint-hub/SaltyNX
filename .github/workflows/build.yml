@@ -135,7 +135,7 @@ jobs:
               exit 1
             fi
           done
-          for marker in "session limit"; do
+          for marker in "session limit" "no executable main region found" "disabled by nofps.flag"; do
             if grep -aqF "$marker" saltysd_core/saltynx_core.elf; then
               say "core marker present: $marker"
             else
