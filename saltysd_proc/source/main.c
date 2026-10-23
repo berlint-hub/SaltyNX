@@ -317,8 +317,16 @@ static u64 pendingRefreshRequired = 0;
 // The measurement wanders by half a hertz, so rounding it to a whole hertz flips
 // between two neighbours every few seconds - and every flip is a panel mode switch.
 // The requested rate therefore keeps a deadband of its own: it only moves when the
-// measurement has clearly left it, not when it grazes the boundary.
-#define FINE_TARGET_HYST     0.55f
+// measurement has clearly left it, not when it grazes the boundary. Upwards that
+// band has to cover more than half a hertz, because the resting point of this whole
+// loop is a panel at exactly the app's rate - the one place where the client's window
+// flickers between "one more present than the panel" and "one fewer". A 50 Hz panel
+// with 50 fps content read 51.00 on the device, and 0.55 Hz did not stop it.
+#define FINE_TARGET_HYST     1.20f
+// How far a rise may move the panel in one step. A measurement 15 hertz above the
+// panel is either a scene change or a burst of double presents, and only a step this
+// size is cheap enough to be wrong about.
+#define FINE_RISE_STEP       2u
 // Falling is the more dangerous direction: the published value sits a little under
 // the panel rate whenever the app is being throttled rather than free-running. The
 // client averages sixteen present intervals, so one late interval moves the number
@@ -784,9 +792,10 @@ void updateRefreshRateForApp() {
                 // to 60 and straight back.
                 u64 requiredMs;
                 if (fineRate)
-                    requiredMs = (delta <= REFRESH_RATE_SMALL_DELTA)
-                               ? REFRESH_RATE_FINE_MS
-                               : REFRESH_RATE_LARGE_MS;
+                    requiredMs = (check_refresh_rate < temp_refreshRate &&
+                                  delta > REFRESH_RATE_SMALL_DELTA)
+                               ? REFRESH_RATE_LARGE_MS
+                               : REFRESH_RATE_FINE_MS;
                 else if (check_refresh_rate > temp_refreshRate)
                     requiredMs = REFRESH_RATE_SMALL_UP_MS;
                 else if (delta <= REFRESH_RATE_SMALL_DELTA)
@@ -800,16 +809,25 @@ void updateRefreshRateForApp() {
             else if (now - pendingRefreshSince >= pendingRefreshRequired) {
                 const u32 heldMs = (u32)((now - pendingRefreshSince) / SV_TICKS_PER_MS);
                 uint32_t achievedRate = 0;
-                SetDisplayRefreshRate(check_refresh_rate);
+                // Fine mode never jumps. On the device a single measurement took the
+                // panel from 45 to 60 Hz after 1.5 s - fifteen mode switches' worth of
+                // change on the strength of a number that had been 45.09 fourteen
+                // seconds earlier. Two hertz a step means a wrong reading costs one
+                // step and falls straight back, while a real scene change still gets
+                // there, one hold at a time.
+                uint32_t applyRate = check_refresh_rate;
+                if (fineRate && applyRate > temp_refreshRate + FINE_RISE_STEP)
+                    applyRate = temp_refreshRate + FINE_RISE_STEP;
+                SetDisplayRefreshRate(applyRate);
                 // The panel quantises and clamps (25 Hz is served as 50 Hz on OLED),
                 // so report what the hardware ended up at, not what we asked for.
                 if (GetDisplayRefreshRate(&achievedRate, true))
                     SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms, active %u Hz%s)\n",
-                                   temp_refreshRate, check_refresh_rate, heldMs, achievedRate,
+                                   temp_refreshRate, applyRate, heldMs, achievedRate,
                                    fineRate ? ", measured" : "");
                 else
                     SaltyNX_printf(APP_NAME ": display-sync: refresh rate %u -> %u Hz requested (target held %u ms%s)\n",
-                                   temp_refreshRate, check_refresh_rate, heldMs,
+                                   temp_refreshRate, applyRate, heldMs,
                                    fineRate ? ", measured" : "");
                 pendingRefreshRate = 0;
                 // A drop to the floor is the only one worth second-guessing: below it
