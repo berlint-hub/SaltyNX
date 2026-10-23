@@ -763,15 +763,30 @@ void updateRefreshRateForApp() {
                 lastFineLog = nowFine;
                 const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
                 const uint32_t smooth_x100 = (uint32_t)(fineAvg * 100.0f);
-                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u smooth=%u.%02u target=%u panel=%u\n",
+                const uint32_t peak_x10 = (uint32_t)(finePeak * 10.0f);
+                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u smooth=%u.%02u target=%u panel=%u peak=%u.%u\n",
                                nx_fps ? "found" : "missing",
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
                                smooth_x100 / 100, smooth_x100 % 100,
-                               fineRate, temp_refreshRate);
+                               fineRate, temp_refreshRate,
+                               peak_x10 / 10, peak_x10 % 10);
             }
         }
-        uint32_t check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);
+        // Once fine mode has measured anything, it is the authority and the client's
+        // quantised target is ignored. It used to be the fallback whenever a single
+        // sample was unusable, and the client derives that target from its own
+        // measurement by rounding to a 15/20/25/.../60 ladder - so a 47 became a 45, the
+        // panel jumped a whole ladder step down on one bad sample, and the loop spent the
+        // next minute climbing back to 47. That is the two of them arguing, and the panel
+        // has no business following a value the client does not consider authoritative
+        // either. Holding the current panel is the honest answer: the panel is already
+        // where this path last put it.
+        uint32_t check_refresh_rate;
+        if (fineSyncEnabled && !isDocked && fineEverMeasured)
+            check_refresh_rate = fineRate ? fineRate : (temp_refreshRate ? temp_refreshRate : refreshRate);
+        else
+            check_refresh_rate = fineRate ? fineRate : (requestedRate ? requestedRate : refreshRate);
         if (check_refresh_rate == 0)
             check_refresh_rate = 60;
         // The 50 Hz floor exists to stop the loop from dragging itself down through the
@@ -958,18 +973,20 @@ void updateRefreshRateForApp() {
             // pushed to 51 every fifteen seconds forever, which is a defect of its own.
             const float agree = fineAvg - (float)temp_refreshRate;
             const bool measurementOnPanel = fineAvgValid && agree < 0.6f && agree > -0.6f;
-            // Three reasons to spend an excursion, and no others:
-            //  - the app was measured above this rate earlier in the session, so the
-            //    panel is probably what is holding it back;
-            //  - the panel is sitting on the floor, which is a clamp rather than a
-            //    content-derived rate - nothing else can ever lift it off 45, so it is
-            //    owed a test even when nothing has been demonstrated;
-            //  - a climb is already in progress, so the previous probe proved the point
-            //    and the next hertz is worth trying.
-            const bool worthTesting = finePeak >= (float)temp_refreshRate + 1.0f ||
-                                      temp_refreshRate <= DISPLAY_SYNC_MIN_RATE ||
-                                      fineClimbing;
-            if (fineRate && measurementOnPanel && worthTesting &&
+            // Any rate the app agrees with is ambiguous and worth spending an excursion
+            // on, and the earlier "only if the app was measured above this rate" rule was
+            // worse than useless: with vsync on, the panel paces the app, so the app can
+            // never be measured above the panel. The evidence the rule asked for is
+            // unobtainable by construction, which made every settled rate above the floor
+            // a dead end - the panel would drop to 47 after a scene dip and sit there for
+            // the rest of the session, because neither the deadband nor the gate could
+            // ever argue upward again.
+            //
+            // The excursion is the instrument. One hertz up for a few seconds answers the
+            // only question that matters - does the app follow? - and the parking backoff
+            // makes a wrong guess cost one excursion every five minutes, doubling to half
+            // an hour. A climb that already succeeded skips the settle wait.
+            if (fineRate && measurementOnPanel &&
                 temp_refreshRate < HandheldModeRefreshRateAllowed.max && !probeFromRate) {
                 if (finePinnedSince == 0)
                     finePinnedSince = now;

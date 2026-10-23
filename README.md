@@ -249,6 +249,20 @@ The fine target may not climb past the panel on a one hertz measurement. The cli
 
 The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
+### Two masters, one control
+
+With vsync on, the panel paces the emulator: set 47 Hz and the emulator presents 47 frames. That is the whole reason the fine path exists, and it has a consequence that is easy to miss - **the measurement can never show that the app wants to go faster**, because the app is being shown at the rate the panel is already running. `FPSavg` reports what the panel did, not what the content could do.
+
+Everything below followed from getting that wrong.
+
+**The evidence gate was unobtainable.** Until 2.1.35 a probe was armed only when `finePeak` - the highest measurement of the session - was at least one hertz above the current panel. Under pacing that can never happen. A panel that dropped to 47 after a scene dip stayed at 47 for the rest of the session: the deadband refuses a rise of one hertz, and the gate demanded evidence that measuring could not produce. Every settled rate above the floor was a dead end.
+
+The excursion is now the instrument, and the only one. One hertz up for six seconds answers the question directly - does the app follow? - and the parking backoff bounds the cost of a wrong guess: five minutes, doubling to half an hour. Measured against the shipped logic, a panel reset to 47 with a 50 fps app behind it never moves; with this change it climbs 47 -> 48 -> 49 -> 50 in about twenty seconds.
+
+**The two writers to `FPSlocked`.** Fine mode used to fall back to the client's `FPSlocked` whenever a single sample was unusable, and the client derives that value by rounding its own measurement onto a 15/20/25/30/35/40/45/50/55/60 ladder. A 47 therefore became a 45: one bad sample dropped the panel a whole ladder step, and the loop spent the next minute climbing back to 47. Once fine mode has measured anything it is now the authority, and an unusable sample holds the current panel instead - the panel is already where this path put it, so holding it is the honest answer.
+
+`FPSavg` stays the instrument, but only for *downward* moves. A value below the panel is real evidence that the content is slower than the panel. A value equal to the panel proves nothing.
+
 ### Why the panel used to sink and stay sunk
 
 Reported on 2.1.31 as "turn on handheld display sync and it drops to 45 Hz and stays there". It was a real defect, and the mechanism is worth writing down because everything in it looks correct in isolation.
