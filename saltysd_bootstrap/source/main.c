@@ -140,12 +140,27 @@ int main(int argc, char *argv[])
 	write_log("SaltySD Bootstrap: we in here\n");
 	#endif
 
-	do
+	// Bounded, because this runs inside the game's own process at its entry point: an
+	// unbounded wait here is a game that never starts and never says why. Ten seconds is
+	// far longer than a healthy sysmodule needs - the port exists before any title can be
+	// launched - so reaching the limit means something is genuinely wrong, and the log
+	// line is the only way anyone would ever find out which.
 	{
-		ret = svcConnectToNamedPort(&saltysd, "SaltySD");
-		svcSleepThread(1000*1000);
+		unsigned waited_ms = 0;
+		do
+		{
+			ret = svcConnectToNamedPort(&saltysd, "SaltySD");
+			if (R_SUCCEEDED(ret)) break;
+			svcSleepThread(1000*1000);
+			waited_ms += 1;
+		}
+		while (waited_ms < 10000);
+		#if defined(SWITCH) || defined(OUNCE)
+		if (R_FAILED(ret))
+			write_log("SaltySD Bootstrap: SaltySD port did not answer in 10 s, giving up\n");
+		#endif
+		if (R_FAILED(ret)) goto fail;
 	}
-	while (ret);
 	
 	setupAppHeap();
 

@@ -73,8 +73,25 @@ static bool hijack_bootstrap(Handle* debug, u64 pid, u64 tid, bool isA64)
         size_t saltynx_bootstrap_elf_size = ftell(file);
         fseek(file, 0, 0);
         u8* elf = malloc(saltynx_bootstrap_elf_size);
-        if (!elf || fread(elf, saltynx_bootstrap_elf_size, 1, file) != 1) {
-            SaltyNX_printf(APP_NAME ": couldn't read SaltySD/saltynx_bootstrap.elf, aborting...\n");
+        // Retried, because a short read here is what a cold SD card does to the first game
+        // launched after a reboot - the same fault that used to put garbage into the Core
+        // loader, except this one only loses the hijack rather than the game. Three
+        // attempts because the whole launch is waiting on this and the failure is a
+        // warming card, not a damaged one.
+        bool read = false;
+        if (elf) {
+            for (unsigned attempt = 0; attempt < 3 && !read; attempt++) {
+                if (attempt) {
+                    clearerr(file);
+                    fseek(file, 0, 0);
+                    svcSleepThread(100ull * 1000 * 1000);
+                }
+                read = fread(elf, saltynx_bootstrap_elf_size, 1, file) == 1;
+            }
+        }
+        if (!elf || !read) {
+            SaltyNX_printf(APP_NAME ": couldn't read SaltySD/saltynx_bootstrap.elf after 3 attempts "
+                           "(%zu B), aborting...\n", saltynx_bootstrap_elf_size);
             fclose(file);
             free(elf);
             svcCloseHandle(*debug);

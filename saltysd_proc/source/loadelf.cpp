@@ -10,6 +10,38 @@
 
 using namespace elf_parser;
 
+// Read exactly size bytes from the start of f, retrying a short read.
+//
+// This is not defensive tidying, it is a crash fix. The buffer these reads land in is not
+// a local one: it is a live mapping of the game's own memory (svcMapProcessMemory), so a
+// short read leaves the game's own uninitialised bytes in place and they are then parsed
+// as an ELF header. The segments that come out of that are nonsense, they are written back
+// into the process, and the game dies on its first instruction.
+//
+// And a short read here is the normal case, not an exotic one. The very first title
+// launched after a reboot reads from an SD card that has just been powered up and is still
+// sorting itself out; the second title launches onto a warm card and succeeds. That is
+// exactly the report - "the first game after a reboot crashes, and it works if I start the
+// emulator first" - and until now that read was not even checked.
+//
+// Five attempts with a tenth of a second between them is about half a second in total,
+// spent only when the read actually fails, which is far cheaper than losing the launch.
+#define ELF_READ_ATTEMPTS 5
+#define ELF_READ_RETRY_MS 100ULL
+
+static bool read_elf_exact(FILE* f, void* dst, u32 size)
+{
+    for (unsigned attempt = 0; attempt < ELF_READ_ATTEMPTS; attempt++)
+    {
+        if (fseek(f, 0, SEEK_SET) == 0 && fread(dst, size, 1, f) == 1)
+            return true;
+        // A short read still advanced the position, so the next attempt has to rewind.
+        clearerr(f);
+        svcSleepThread(ELF_READ_RETRY_MS * 1000 * 1000);
+    }
+    return false;
+}
+
 void *text_save;
 void *data_save;
 u64 text_addr, data_addr, text_fsize, data_fsize, text_msize, data_msize;
@@ -205,7 +237,16 @@ Result load_elf_proc(Handle proc, uint64_t pid, uint64_t heap, uint64_t* start, 
 		return 1;
 	}
 
-	fread(elf_data, elf_size, 1, f);
+	if (!read_elf_exact(f, elf_data, elf_size)) {
+		// Leave nothing half-written and nothing to parse. Returning an error makes the
+		// bootstrap take its fail path, which is a clean refusal rather than a game that
+		// dies somewhere inside its own startup.
+		SaltyNX_printf(APP_NAME ": load_elf_proc could not read %u B from the SD card after %d attempts, aborting\n",
+		               elf_size, ELF_READ_ATTEMPTS);
+		svcUnmapProcessMemory(elf_data, proc, map_addr, 0x200000);
+		svcUnmapProcessCodeMemory(proc, map_addr, heap_buffer_address, 0x200000);
+		return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+	}
 
 	SaltyNX_printf(APP_NAME ": load_elf_proc loaded ELF to buffer.\n");
 	
@@ -336,7 +377,13 @@ Result load_elf32_proc(Handle proc, uint64_t pid, uint32_t heap, uint32_t* start
 		return 1;
 	}
 
-	fread(elf_data, elf_size, 1, f);
+	if (!read_elf_exact(f, elf_data, elf_size)) {
+		SaltyNX_printf(APP_NAME ": load_elf_proc could not read %u B from the SD card after %d attempts, aborting\n",
+		               elf_size, ELF_READ_ATTEMPTS);
+		svcUnmapProcessMemory(elf_data, proc, map_addr, 0x200000);
+		svcUnmapProcessCodeMemory(proc, map_addr, heap_buffer_address, 0x200000);
+		return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+	}
 	
 	elf32_parser::Elf32_parser elf(elf_data);
 

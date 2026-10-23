@@ -103,7 +103,9 @@ jobs:
                         "FPSLocker target for this session" \
                         "never ran in this process" \
                         "is MISSING - games will start without SaltyNX" \
-                        "saltynx_core.elf"; do
+                        "saltynx_core.elf" \
+                        "could not read %u B from the SD card" \
+                        "saltynx_bootstrap.elf after 3 attempts"; do
             if grep -aqF "$marker" saltysd_proc/saltynx_proc.elf; then
               say "marker present: $marker"
             else
@@ -120,6 +122,17 @@ jobs:
               exit 1
             else
               say "core marker absent (expected): $marker"
+            fi
+          done
+          # The bootstrap is the file that decides whether a game starts at all: it runs
+          # at the game's own entry point and exits the process if it cannot reach the
+          # sysmodule or load the Core. Both of its give-up paths must stay visible.
+          for marker in "did not answer in 10 s"; do
+            if grep -aqF "$marker" saltysd_bootstrap/saltynx_bootstrap.elf; then
+              say "bootstrap marker present: $marker"
+            else
+              echo "::error::marker missing from saltynx_bootstrap.elf: $marker"
+              exit 1
             fi
           done
           for marker in "session limit"; do

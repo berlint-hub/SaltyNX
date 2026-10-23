@@ -351,6 +351,38 @@ Since 2.1.39 the 30 second status line carries `plugin=`, and the 30 second "no 
 
 Worth knowing while comparing titles: NetherSX2 reports the first state as *working*. It publishes into the same block, but it finds the block rather than creating it - the Core still has to run and build it. So an emulator that measures correctly proves the Core loaded, and says nothing about whether NX-FPS's own present hook fires.
 
+### The first game after a reboot crashed. So did the second, if you were unlucky.
+
+Reported as: reboot, launch a native game, "the application had to close", straight back to the menu. Launch NetherSX2 first, quit it, and every native game then works until the next reboot.
+
+That workaround is the diagnosis. It says the fault depends on the state of the SD card, not on the game, and that warming the card up fixes it. Following it gave a chain with no guesswork in it.
+
+The sysmodule loads the Core for the game by reading `sdmc:/SaltySD/saltynx_core.elf` into *a mapping of the game's own memory* (`svcMapProcessMemory`), then parses that buffer as an ELF and writes the result back over the process. The read was:
+
+```c
+fread(elf_data, elf_size, 1, f);
+```
+
+The return value was not checked. On a cold card the read comes back short, so the buffer is left holding the game's own uninitialised bytes, and those get parsed as an ELF header. The segments that come out are nonsense. The game dies on its first instruction, and the system reports it as an application error.
+
+The other ending is just as bad. If the parse fails instead, the bootstrap's `saltySDLoadELF` returns an error, `main()` takes `goto fail`, `__saltysd_exit_func` is still `exitProcess` rather than the Core, and `__rel_exit` calls `svcExitProcess()`. The game is not crashed at that point - it is **deliberately terminated** by code running inside it. Same dialog.
+
+Either way the report is identical, and both come from one unchecked read.
+
+| | before | now |
+|---|---|---|
+| Core read | one `fread`, result discarded | five attempts, 100 ms apart, result checked |
+| short read | garbage parsed as ELF | retried, then a clean refusal |
+| failure | game terminated from inside itself | nothing half-written into the process |
+| bootstrap ELF read | one attempt, aborts the hijack | three attempts |
+| port wait in the bootstrap | infinite | 10 s, then a logged give-up |
+
+The bootstrap's wait for the sysmodule was `do { connect } while (failed)` with no limit at all - a game that never starts and never says why. It is now bounded and says so through `svcOutputDebugString`.
+
+### Why the emulator-first trick worked
+
+Nothing about NetherSX2 made native games work. It touched the SD card, and the next read from a card that had been idle since boot succeeded. Anything that reads from `sdmc:` first would have done the same, which is why the fix is a retry and not a special case for the emulator.
+
 ### Who does what: SaltyNX, the Core, and FPSLocker
 
 These three are constantly mistaken for alternatives. They are a stack, and the confusion costs people a whole evening every time, because the missing piece is the one nobody installs separately.
