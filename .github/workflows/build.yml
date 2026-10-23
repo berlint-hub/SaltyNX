@@ -98,7 +98,7 @@ jobs:
                         "fine: block=" \
                         "plugin=" \
                         "cap=" \
-                        "missing the FPSLocker target" \
+                        "FPSLocker target for this session" \
                         "never ran in this process" \
                         "is MISSING - games will start without SaltyNX" \
                         "saltynx_core.elf"; do
