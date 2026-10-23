@@ -235,14 +235,18 @@ Consequence worth knowing: a game that genuinely cannot fill 45 FPS gets a 45 Hz
 
 A drop is the only direction that can become permanent. The panel slows down, the compositor then paces the app at the new rate, the app measures that same rate and publishes it, and the loop has no way to tell a game that genuinely runs at 45 from a panel that dragged it down to 45. By the time the value is measured it is genuinely true, so the rate stays until it is set by hand. That is the failure users hit as "sync locked my game at 45 FPS and I have to turn it off and set 50 myself".
 
-Fine mode cannot tell the difference by looking, so it stops looking and starts testing. When the smoothed measurement has sat on the panel rate for fifteen seconds and the panel is below its maximum, the panel goes up one hertz. Then:
+Fine mode cannot tell the difference by looking, so it stops looking and starts testing. When the smoothed measurement has sat on the panel rate for fifteen seconds, the panel is below its maximum, **and the app has demonstrated earlier in this session that it can go faster than the rate it is stuck on**, the panel goes up one hertz. Then:
 
 | what happens next | what it means | what the sync does |
 | --- | --- | --- |
 | the measurement follows within six seconds | the panel was the limiter | stay, and test again fifteen seconds later |
 | the measurement does not follow | the app really runs at that rate | back down, park that rate for five minutes |
 
-The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end. A game that genuinely runs at 45 loses six seconds of every five minutes to a one-hertz excursion, which is the price of never being stuck.
+The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end.
+
+That last condition is what keeps the test out of the way of a game that is simply running correctly. A title sitting at 50 Hz that has never measured above 50 has nothing to prove and is never tested - otherwise it would be pushed to 51 every fifteen seconds forever, which would be a defect of its own. Only the drop is ambiguous, and only a drop that follows a higher rate leaves the evidence behind.
+
+A game that genuinely runs at 45 after having run at 50 loses six seconds of every five minutes to a one-hertz excursion, which is the price of never being stuck.
 
 ```
 SaltyNX: display-sync: testing 45 Hz against 46 Hz, which the app held before

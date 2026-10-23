@@ -407,6 +407,11 @@ static bool fineAvgValid = false;
 static u64 fineSampleTick = 0;
 static uint32_t fineRejects = 0;
 static uint32_t fineInvalid = 0;
+// Highest smoothed value this app has shown. It is the only evidence that a higher
+// rate is worth testing: while the panel holds the app down, the app never measures
+// above the panel, so "the app is capable of more" cannot be observed at the moment
+// it matters - only remembered from before the drop.
+static float finePeak = 0.0f;
 
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
@@ -454,6 +459,8 @@ static void fineSampleMeasurement() {
     }
     fineRejects = 0;
     fineAvg += (avg - fineAvg) * FINE_SMOOTHING;
+    if (fineAvg > finePeak)
+        finePeak = fineAvg;
 }
 
 // Returns 0 when there is nothing trustworthy to follow.
@@ -552,6 +559,7 @@ void cleanAppData() {
     probeCount = 0;
     sameRateSince = 0;
     finePinnedSince = 0;
+    finePeak = 0.0f;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;
@@ -778,10 +786,17 @@ void updateRefreshRateForApp() {
             // Ambiguous only when the smoothed measurement sits on the panel rate: a
             // 42 next to a 45 Hz panel is the app being the limiter and there is
             // nothing to prove. Agreement for fifteen seconds is the lock shape.
+            //
+            // And only when the app has demonstrated, earlier in this session, that it
+            // can go above the rate it is stuck on. Without that the test would fire on
+            // every correctly running game - a title sitting happily at 50 would be
+            // pushed to 51 every fifteen seconds forever, which is a defect of its own.
             const float agree = fineAvg - (float)temp_refreshRate;
             const bool measurementOnPanel = fineAvgValid && agree < 0.6f && agree > -0.6f;
-            if (fineRate && measurementOnPanel && temp_refreshRate < HandheldModeRefreshRateAllowed.max &&
-                !probeFromRate) {
+            const uint32_t demonstrated = (uint32_t)(finePeak + 0.5f);
+            const bool worthTesting = temp_refreshRate + FINE_LOCK_STEP <= demonstrated;
+            if (fineRate && measurementOnPanel && worthTesting &&
+                temp_refreshRate < HandheldModeRefreshRateAllowed.max && !probeFromRate) {
                 if (finePinnedSince == 0)
                     finePinnedSince = now;
                 const bool parked = (temp_refreshRate == probeFailedRate) &&
