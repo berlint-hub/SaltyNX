@@ -160,7 +160,7 @@ Everything else still applies, with two exceptions:
 | deadband | 1 Hz | 0 - a one hertz change is the point |
 | rise / drop / large | 5 s / 20 s / 1.5 s | 4 s / 4 s / 1.5 s |
 | measurement | client's number, used as is | one sample a second, jumping ones refused, the rest smoothed |
-| target deadband | 1 Hz | on the *output*: rises past 0.55 Hz, falls only past 1.2 Hz |
+| target deadband | 1 Hz | on the *output*: rises past 0.55 Hz, falls only past 1.8 Hz |
 | lock-in test | armed on a drop to the floor | disabled (the loop is the point) |
 
 Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is zero before the first presented frame, so "not measuring yet" must not move the panel.
@@ -243,7 +243,7 @@ Fine mode cannot tell the difference by looking, so it stops looking and starts 
 | the measurement follows within six seconds | the panel was the limiter | stay, and test again fifteen seconds later |
 | the measurement does not follow | the app really runs at that rate | back down, park that rate - five minutes, doubling on each further failure up to half an hour |
 
-There is also a deadband on the requested rate itself, separate from the one on the measurement, and it is not symmetric. Rounding a smoothed value that wanders by half a hertz flips between two neighbours every few seconds, and every flip is a panel mode switch: a game running at 49.5 spent a session alternating 48 -> 49 -> 48 about every forty seconds. So the requested rate only rises once the measurement is more than 0.55 Hz above it. Falling is held to a wider margin, 1.2 Hz, because a value that runs under the panel rate is normal - the app is being throttled by the panel rather than free-running, and its own count sags accordingly. Following that sag downwards is what made the panel flap; it now stays put unless the app has clearly dropped.
+There is also a deadband on the requested rate itself, separate from the one on the measurement, and it is not symmetric. Rounding a smoothed value that wanders by half a hertz flips between two neighbours every few seconds, and every flip is a panel mode switch: a game running at 49.5 spent a session alternating 48 -> 49 -> 48 about every forty seconds. So the requested rate only rises once the measurement is more than 0.55 Hz above it. Falling is held to a wider margin, 1.8 Hz, because a value that runs under the panel rate is normal - the app is being throttled by the panel rather than free-running, and its own count sags accordingly. The client averages sixteen present intervals, so one late interval moves its number by a whole hertz: at a 49 Hz panel the log sat on 47.99 for minutes. Following that sag downwards is what made the panel flap; it now stays put unless the app has clearly dropped two hertz, and a scene that really does fall is still followed.
 
 The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end.
 

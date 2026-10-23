@@ -320,9 +320,14 @@ static u64 pendingRefreshRequired = 0;
 // measurement has clearly left it, not when it grazes the boundary.
 #define FINE_TARGET_HYST     0.55f
 // Falling is the more dangerous direction: the published value sits a little under
-// the panel rate whenever the app is being throttled rather than free-running, so a
-// whole hertz of drift downwards is normal. Only follow a fall that is clear of that.
-#define FINE_TARGET_FALL     1.20f
+// the panel rate whenever the app is being throttled rather than free-running. The
+// client averages sixteen present intervals, so one late interval moves the number
+// by a whole hertz - 15 x 20.4 ms plus a single 27 ms one reads 48.0, and 20.4 plus
+// a doubled 40.8 ms reads 46.1. At a 49 Hz panel the log sat at 47.99 for minutes,
+// which is a hertz of jitter, not a hertz of content. A fall therefore has to clear
+// 1.8 Hz before it is believed: that follows a full two hertz scene drop, and
+// ignores the noise the panel produces by simply holding the app back.
+#define FINE_TARGET_FALL     1.80f
 
 static bool probeArmed = false;      // last applied change went below the demonstrated max
 static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
@@ -460,6 +465,7 @@ static void fineSampleMeasurement() {
         return;
     }
     fineInvalid = 0;
+    fineEverMeasured = true;
     if (!fineAvgValid) {
         fineAvg = avg;
         fineAvgValid = true;
@@ -474,7 +480,6 @@ static void fineSampleMeasurement() {
         return;
     }
     fineRejects = 0;
-    fineEverMeasured = true;
     fineAvg += (avg - fineAvg) * FINE_SMOOTHING;
     if (fineAvg > finePeak)
         finePeak = fineAvg;
