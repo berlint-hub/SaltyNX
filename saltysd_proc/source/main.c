@@ -261,7 +261,9 @@ void checkIfDmntChtNeedsToBeActive() {
 #define REFRESH_RATE_SMALL_UP_MS   5000ULL
 #define REFRESH_RATE_SMALL_DOWN_MS 20000ULL
 #define REFRESH_RATE_LARGE_MS      1500ULL
-#define REFRESH_RATE_FINE_MS       4000ULL
+// Fine mode has no hold constant any more. See FINE_CHANGE_MIN_MS: it rate-limits the
+// actuator instead of delaying the decision, so a real change lands on the next write
+// and a churning one is bounded by how often the hardware may be touched.
 #define REFRESH_RATE_DEADBAND_HZ   1u
 #define SV_TICKS_PER_MS        19200ULL
 
@@ -299,12 +301,12 @@ static u64 pendingRefreshRequired = 0;
 // Fine mode has no way out of a lock on its own: the panel paces the app, the app
 // measures the panel, and "the game runs at 45" and "the panel is holding the game at
 // 45" produce the same number by construction. The only test that separates them is to
-// raise the panel and watch whether the measurement follows. Wait fifteen seconds of
+// raise the panel and watch whether the measurement follows. Wait eight seconds of
 // agreement before suspecting it, then test 2 Hz up - two, not five, because one hertz
 // is the whole point of this path. One hertz, because a 2 Hz excursion overshoots: at a
 // 49 Hz panel the app lands on 50, the test wants 51, and the panel ends up one hertz
 // off with the app shorting frames.
-#define FINE_LOCK_SUSPECT_MS 15000ULL
+#define FINE_LOCK_SUSPECT_MS 8000ULL
 #define FINE_LOCK_STEP       1u
 // A successful test is followed by another one, so the panel climbs 45 -> 47 -> 49 -> 51
 // until the app stops following. A failed one parks that rate for five minutes; the
@@ -323,10 +325,10 @@ static u64 pendingRefreshRequired = 0;
 // flickers between "one more present than the panel" and "one fewer". A 50 Hz panel
 // with 50 fps content read 51.00 on the device, and 0.55 Hz did not stop it.
 #define FINE_TARGET_HYST     1.20f
-// How far a rise may move the panel in one step. A measurement 15 hertz above the
-// panel is either a scene change or a burst of double presents, and only a step this
-// size is cheap enough to be wrong about.
-#define FINE_RISE_STEP       2u
+// Fine mode used to step towards its target, two hertz at a time, because each step was
+// believed to be a mode switch worth avoiding. In handheld it is two register writes, so
+// a 60 -> 47 fall is one write rather than seven, and being wrong costs exactly the same
+// either way - the evidence that produced the target already had to persist.
 // Falling is the more dangerous direction: the published value sits a little under
 // the panel rate whenever the app is being throttled rather than free-running. The
 // client averages sixteen present intervals, so one late interval moves the number
@@ -431,31 +433,53 @@ static void loadFineSyncFlag() {
 // How often the published value is read. This used to be 900 ms, which was chosen to
 // match a client that publishes once a second - but it meant a value that arrived just
 // after a sample waited up to 900 ms to be seen, on top of the client's own delay.
-// Reading four times a second and letting the time constant below do the smoothing is
-// the same filter with less latency, because a coefficient derived from the interval
-// makes the wall-clock behaviour independent of the sampling rate. Sampling faster than
-// the client publishes adds no information and no noise: the same value read twice
-// simply moves the average by the smaller step it now deserves.
+// The client publishes once a second, so this decides how long a value can sit unread.
+// It is 100 ms of the total delay now, against 900 in the original.
 #define FINE_SAMPLE_MS     100ULL
-// Time constant of the averaging filter, chosen so the wall-clock smoothing is exactly
-// what it has always been. The old filter applied a fixed 0.35 once per 900 ms sample -
-// it kept 0.65 of the error every 900 ms, which is not exp(-900/2571), the two differ.
-// Reproducing that with nine 100 ms sub-steps needs (1 - alpha)^9 = 0.65, so alpha is
-// 0.04674 and the constant is 2140 ms. Deriving alpha from the measured interval instead
-// of hard-coding it is what lets the sampling rate change without the smoothing changing
-// with it; a linear ramp stands in for 1 - exp(-dt/tau), which at these step sizes agrees
-// to better than a tenth of a percent and costs no libm call.
-#define FINE_TAU_MS      2140ULL
+// The only thing rate-limited is the actuator, and it is doing two jobs at once.
+//
+// The first is the hardware. In handheld a rate change is not a mode set at all -
+// setPLLDHandheldRefreshRate() writes one word to PLLD_BASE and one to PLLD_MISC and
+// returns, with no ioctl, no blanking and nothing to wait on. It is cheap, but not free:
+// the panel re-locks on a frame boundary and that one frame is wrong.
+//
+// The second is the measurement. Right after a write the panel is at a new rate and the
+// publisher has not yet produced a second at that rate, so the value arriving next
+// describes the transition, not the new steady state. Deciding on it is how a single
+// event becomes two writes in opposite directions. Holding off for most of a publish
+// period means the next decision sees a sample that was actually measured at the new
+// rate.
+//
+// It costs nothing: the fastest publisher here is once a second, so a change cannot be
+// justified more often than that anyway.
+#define FINE_CHANGE_MIN_MS 700ULL
+// There is deliberately no smoothing filter on the measurement any more, and removing it
+// was the largest single improvement in responsiveness this loop has had.
+//
+// FPSavg is not a raw frame counter. It is already an average over the publisher's own
+// window - a second for NetherSX2, similar for NX-FPS - so the 2140 ms time constant was
+// a second averaging stage on top of a value that had already been averaged for a
+// second. It existed to stop one bad sample from reaching the decision, and the jump
+// rejection below does that earlier and better: anything more than two hertz from the
+// current value is refused until it has persisted. The extra stage bought no protection
+// and cost two seconds of every response.
+//
+// The filtering now happens where it belongs, in fineMeasuredTarget, which decides
+// whether a difference is real. A decision is a much better place to be conservative
+// than a measurement is.
 #define FINE_REJECT_HZ   2.0f
-// How long a jump has to persist before it is believed. This is the single largest delay
-// in the whole loop, and it was set to nine seconds for a reason that no longer holds:
-// it was "ten samples in a row", which at the old 900 ms sampling really was nine
-// seconds of protection against a hitch. Two seconds still outlasts any hitch - the
-// client's own window is 320 ms and a stalled second is a handful of samples - and it
-// takes a real scene change from thirteen seconds to six. Measured against dips of one
-// to ten seconds, two seconds holds the same line as nine did: anything up to three
-// seconds is ignored, anything from five seconds is followed.
-#define FINE_REJECT_MS   2000ULL
+// How long a jump has to persist before it is believed. This is now the entire latency
+// of a real scene change, so it is the one number worth getting exactly right.
+//
+// Three seconds, and the reason is asymmetric cost rather than taste. A fall is cheap to
+// make and expensive to undo: once the panel is at 45 the compositor paces the app there,
+// the app then measures 45, and nothing in the measurement can distinguish "the game runs
+// at 45" from "the panel is holding it at 45". The only way back up is a probe, which is
+// eight seconds of agreement plus six seconds of test per hertz - about thirty seconds to
+// recover five. So a fall that was really a two second stutter costs far more than the
+// three seconds of extra latency this constant spends on every genuine change. Dips up to
+// three seconds are ignored; a scene that actually changed is followed three seconds later.
+#define FINE_REJECT_MS   3000ULL
 // Unusable samples are a different case: 0 and 255 are not slowdowns, they are a client
 // that has not published yet or an app that stopped presenting. Nine seconds of patience
 // costs nothing when the alternative is dropping to the client's quantised path.
@@ -467,7 +491,22 @@ static u64 fineSampleTick = 0;
 static u64 fineRejectSince = 0;
 static u64 fineInvalidSince = 0;
 static float fineLastRaw = 0.0f;
-// Highest smoothed value this app has shown. It is the only evidence that a higher
+// The last three numbers the publisher actually produced, oldest first.
+//
+// The sampling loop reads FPSavg ten times a second and the publisher writes it once, so
+// nine of those ten reads are the same number again and carry no information. Only a
+// change goes in the ring, which is what makes a median over it a median over published
+// values rather than over repeated reads of the same one.
+//
+// The median is here for one failure in particular. A single sample that dips is enough
+// to move a panel that is otherwise correct, and because the way back up is a probe, that
+// one dip costs about thirty seconds of the game running five hertz slow. The median
+// removes exactly that case - one bad value among three cannot win - while a change that
+// persists replaces the whole ring within two publishes.
+static float fineRing[3] = {0.0f, 0.0f, 0.0f};
+static uint32_t fineRingCount = 0;
+static float fineRingLast = 0.0f;
+// Highest value this app has published. It is the only evidence that a higher
 // rate is worth testing: while the panel holds the app down, the app never measures
 // above the panel, so "the app is capable of more" cannot be observed at the moment
 // it matters - only remembered from before the drop.
@@ -476,12 +515,57 @@ static float finePeak = 0.0f;
 // escape test keeps. fineEverMeasured: the app has published at least one usable
 // value, so a later silence is a pause, not a missing publisher.
 static uint32_t fineTarget = 0;
+// When the panel was last written. FINE_CHANGE_MIN_MS is measured from here, so the
+// limit survives a target that changes twice in quick succession.
+static u64 fineLastApplyTick = 0;
 static bool fineEverMeasured = false;
 static uint32_t probeFailCount = 0;
 // Set while a fine probe has just been followed, cleared as soon as one is not. A
 // climb is the one state in which the next probe is worth spending without asking for
 // more evidence first - the previous one already proved the panel was the limiter.
 static bool fineClimbing = false;
+
+// Start the ring over from one value. Used when the publisher has just shown something
+// that outlived the rejection window: that is a new scene, and the old values are not
+// evidence about it.
+static void fineResetRing(float v) {
+    fineRing[0] = v;
+    fineRing[1] = v;
+    fineRing[2] = v;
+    fineRingCount = 3;
+    fineRingLast = v;
+}
+
+static void finePushSample(float v) {
+    if (fineRingCount == 3 && v == fineRingLast)
+        return;
+    fineRingLast = v;
+    if (fineRingCount < 3) {
+        fineRing[fineRingCount++] = v;
+    }
+    else {
+        fineRing[0] = fineRing[1];
+        fineRing[1] = fineRing[2];
+        fineRing[2] = v;
+    }
+}
+
+// Median of up to three, with the two shorter cases returning the newest value - there is
+// nothing to take a median of yet, and waiting for the ring to fill would just delay the
+// first decision.
+static float fineMedian() {
+    if (fineRingCount == 0)
+        return 0.0f;
+    if (fineRingCount == 1)
+        return fineRing[0];
+    if (fineRingCount == 2)
+        return fineRing[1];
+    float a = fineRing[0], b = fineRing[1], c = fineRing[2];
+    if (a > b) { const float t = a; a = b; b = t; }
+    if (b > c) b = c;
+    if (a > b) b = a;
+    return b;
+}
 
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
@@ -523,6 +607,7 @@ static void fineSampleMeasurement() {
     fineInvalidSince = 0;
     fineEverMeasured = true;
     if (!fineAvgValid) {
+        fineResetRing(avg);
         fineAvg = avg;
         fineAvgValid = true;
         fineRejectSince = 0;
@@ -532,16 +617,19 @@ static void fineSampleMeasurement() {
         if (fineRejectSince == 0)
             fineRejectSince = now;
         else if (now - fineRejectSince >= FINE_REJECT_MS * SV_TICKS_PER_MS) {
+            fineResetRing(avg);
             fineAvg = avg;
             fineRejectSince = 0;
         }
         return;
     }
     fineRejectSince = 0;
-    float alpha = (float)sinceMs / (float)FINE_TAU_MS;
-    if (alpha > 1.0f) alpha = 1.0f;
-    if (alpha < 0.002f) alpha = 0.002f;
-    fineAvg += (avg - fineAvg) * alpha;
+    // No time constant. See the note where FINE_TAU_MS used to be: FPSavg is already an
+    // average over the publisher's window, and averaging it again was two seconds of
+    // delay with no robustness to show for it once the jump rejection above screens the
+    // outliers and the ring below screens the single dips.
+    finePushSample(avg);
+    fineAvg = fineMedian();
     if (fineAvg > finePeak)
         finePeak = fineAvg;
 }
@@ -710,12 +798,15 @@ void cleanAppData() {
     finePinnedSince = 0;
     finePeak = 0.0f;
     fineTarget = 0;
+    fineLastApplyTick = 0;
     fineEverMeasured = false;
     probeFailCount = 0;
     fineClimbing = false;
     fineRejectSince = 0;
     fineInvalidSince = 0;
     fineLastRaw = 0.0f;
+    fineRingCount = 0;
+    fineRingLast = 0.0f;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;
@@ -807,13 +898,13 @@ void updateRefreshRateForApp() {
             if (nowFine - lastFineLog >= 30000ULL * SV_TICKS_PER_MS) {
                 lastFineLog = nowFine;
                 const uint32_t avg_x100 = nx_fps ? (uint32_t)(nx_fps->FPSavg * 100.0f) : 0;
-                const uint32_t smooth_x100 = (uint32_t)(fineAvg * 100.0f);
+                const uint32_t meas_x100 = (uint32_t)(fineAvg * 100.0f);
                 const uint32_t peak_x10 = (uint32_t)(finePeak * 10.0f);
-                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u smooth=%u.%02u target=%u panel=%u peak=%u.%u\n",
+                SaltyNX_printf(APP_NAME ": fine: block=%s FPS=%u FPSavg=%u.%02u meas=%u.%02u target=%u panel=%u peak=%u.%u\n",
                                nx_fps ? "found" : "missing",
                                nx_fps ? (u32)nx_fps->FPS : 0,
                                avg_x100 / 100, avg_x100 % 100,
-                               smooth_x100 / 100, smooth_x100 % 100,
+                               meas_x100 / 100, meas_x100 % 100,
                                fineRate, temp_refreshRate,
                                peak_x10 / 10, peak_x10 % 10);
             }
@@ -943,10 +1034,12 @@ void updateRefreshRateForApp() {
                 // to 60 and straight back.
                 u64 requiredMs;
                 if (fineRate)
-                    requiredMs = (check_refresh_rate < temp_refreshRate &&
-                                  delta > REFRESH_RATE_SMALL_DELTA)
-                               ? REFRESH_RATE_LARGE_MS
-                               : REFRESH_RATE_FINE_MS;
+                    // Nothing waits. The deadband in fineMeasuredTarget has already
+                    // decided this difference is real; making it also survive a timer was
+                    // the second delay stacked on the measurement filter, and together
+                    // they took four and a half seconds to follow a scene that had been
+                    // unambiguous for one. The actuator's own limit is enforced below.
+                    requiredMs = 0;
                 else if (check_refresh_rate > temp_refreshRate)
                     requiredMs = REFRESH_RATE_SMALL_UP_MS;
                 else if (delta <= REFRESH_RATE_SMALL_DELTA)
@@ -957,19 +1050,24 @@ void updateRefreshRateForApp() {
                 pendingRefreshSince = now;
                 pendingRefreshRequired = requiredMs * SV_TICKS_PER_MS;
             }
-            else if (now - pendingRefreshSince >= pendingRefreshRequired) {
+            else if (now - pendingRefreshSince >= pendingRefreshRequired &&
+                     (!fineRate || !fineLastApplyTick ||
+                      now - fineLastApplyTick >= FINE_CHANGE_MIN_MS * SV_TICKS_PER_MS)) {
                 const u32 heldMs = (u32)((now - pendingRefreshSince) / SV_TICKS_PER_MS);
                 uint32_t achievedRate = 0;
-                // Fine mode never jumps. On the device a single measurement took the
-                // panel from 45 to 60 Hz after 1.5 s - fifteen mode switches' worth of
-                // change on the strength of a number that had been 45.09 fourteen
-                // seconds earlier. Two hertz a step means a wrong reading costs one
-                // step and falls straight back, while a real scene change still gets
-                // there, one hold at a time.
-                uint32_t applyRate = check_refresh_rate;
-                if (fineRate && applyRate > temp_refreshRate + FINE_RISE_STEP)
-                    applyRate = temp_refreshRate + FINE_RISE_STEP;
+                // Straight to the target, in one write. This used to step two hertz at a
+                // time, and the fear behind it was a single measurement taking the panel
+                // from 45 to 60 after 1.5 s on the strength of a number that had been
+                // 45.09 fourteen seconds earlier. That cannot happen now: a fifteen hertz
+                // jump is refused by the jump rejection until it has persisted, and the
+                // deadband will not move at all for anything under 1.2 Hz. What is left
+                // is a target that has already earned its move, and reaching it in one
+                // write rather than seven is strictly better - same final state, one
+                // frame disturbed instead of seven.
+                const uint32_t applyRate = check_refresh_rate;
                 SetDisplayRefreshRate(applyRate);
+                if (fineRate)
+                    fineLastApplyTick = now;
                 // The panel quantises and clamps (25 Hz is served as 50 Hz on OLED),
                 // so report what the hardware ended up at, not what we asked for.
                 if (GetDisplayRefreshRate(&achievedRate, true))

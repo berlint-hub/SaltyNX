@@ -115,7 +115,7 @@ The flags are sampled once a minute instead of once per line, so creating or del
 
 `updateRefreshRateForApp()` follows `NxFpsSharedBlock::FPSlocked` and calls `SetDisplayRefreshRate()` as soon as the value differs. That is correct for FPSLocker, where the value is a stable user choice, but a client that derives the target from a *measured* frame cadence (NetherSX2 does) wobbles by a few Hz every second - 45/50/55 around a 50 FPS game.
 
-Each of those calls is a real panel mode switch. The picture hitches, the hitch perturbs the measured cadence, and the mismatch feeds itself, so the game feels like it keeps slowing down.
+Each of those calls is a real change of the panel rate - two register writes, cheap to perform, but an event all the same, and the frame it lands on is wrong. The picture hitches, the hitch perturbs the measured cadence, and the mismatch feeds itself, so the game feels like it keeps slowing down.
 
 Since 2.1.11 no correction is applied immediately. Since 2.1.12 the wait depends on the direction, because a flat hysteresis only slows a feedback loop down instead of breaking it - a 5 s window on both directions turned five switches in nine seconds into two switches in eleven seconds, still 45 before 50:
 
@@ -236,16 +236,16 @@ Consequence worth knowing: a game that genuinely cannot fill 45 FPS gets a 45 Hz
 
 A drop is the only direction that can become permanent. The panel slows down, the compositor then paces the app at the new rate, the app measures that same rate and publishes it, and the loop has no way to tell a game that genuinely runs at 45 from a panel that dragged it down to 45. By the time the value is measured it is genuinely true, so the rate stays until it is set by hand. That is the failure users hit as "sync locked my game at 45 FPS and I have to turn it off and set 50 myself".
 
-Fine mode cannot tell the difference by looking, so it stops looking and starts testing. When the smoothed measurement has sat on the panel rate for fifteen seconds, the panel is below its maximum, **and the app has demonstrated earlier in this session that it can go faster than the rate it is stuck on**, the panel goes up one hertz. Then:
+Fine mode cannot tell the difference by looking, so it stops looking and starts testing. When the measurement has sat on the panel rate for eight seconds and the panel is below its maximum, the panel goes up one hertz. Then:
 
 | what happens next | what it means | what the sync does |
 | --- | --- | --- |
-| the measurement follows within six seconds | the panel was the limiter | stay, and test again fifteen seconds later |
+| the measurement follows within six seconds | the panel was the limiter | stay, and test again eight seconds later |
 | the measurement does not follow | the app really runs at that rate | back down, park that rate - five minutes, doubling on each further failure up to half an hour |
 
-There is also a deadband on the requested rate itself, separate from the one on the measurement, and it is not symmetric. Rounding a smoothed value that wanders by half a hertz flips between two neighbours every few seconds, and every flip is a panel mode switch: a game running at 49.5 spent a session alternating 48 -> 49 -> 48 about every forty seconds. So the requested rate only rises once the measurement is more than 1.2 Hz above it - wide, because the resting point of the whole loop is a panel at exactly the app's rate, the one place where the client's sixteen-frame window flickers between one present more than the panel and one fewer. Falling is held to a wider margin still, 1.8 Hz, because a value that runs under the panel rate is normal - the app is being throttled by the panel rather than free-running, and its own count sags accordingly. The client averages sixteen present intervals, so one late interval moves its number by a whole hertz: at a 49 Hz panel the log sat on 47.99 for minutes. Following that sag downwards is what made the panel flap; it now stays put unless the app has clearly dropped two hertz, and a scene that really does fall is still followed.
+There is also a deadband on the requested rate itself, separate from the one on the measurement, and it is not symmetric. Rounding a value that wanders by half a hertz flips between two neighbours every few seconds, and every flip is a panel rate change: a game running at 49.5 spent a session alternating 48 -> 49 -> 48 about every forty seconds. So the requested rate only rises once the measurement is more than 1.2 Hz above it - wide, because the resting point of the whole loop is a panel at exactly the app's rate, the one place where the client's sixteen-frame window flickers between one present more than the panel and one fewer. Falling is held to a wider margin still, 1.8 Hz, because a value that runs under the panel rate is normal - the app is being throttled by the panel rather than free-running, and its own count sags accordingly. The client averages sixteen present intervals, so one late interval moves its number by a whole hertz: at a 49 Hz panel the log sat on 47.99 for minutes. Following that sag downwards is what made the panel flap; it now stays put unless the app has clearly dropped two hertz, and a scene that really does fall is still followed.
 
-The fine target may not climb past the panel on a one hertz measurement. The client publishes whole hertz - `estimate_present_fps()` returns an integer - so a 50 fps app in front of a 50 Hz panel reads exactly 50.00 nearly all the time, and 51.00 when one sixteen-interval window catches only short intervals. That single hertz is the entire width of the feedback signal. Under FIFO the app cannot present faster than the panel anyway, so a measurement two hertz clear of the panel is the only evidence that the panel is what is holding it back; a rise now needs that, and the one-hertz climb still happens through the probe above, which is unchanged.
+The fine target may not climb past the panel on a one hertz measurement. The published value is effectively whole hertz - NetherSX2's `estimate_present_fps()` returns an integer - so a 50 fps app in front of a 50 Hz panel reads exactly 50.00 nearly all the time, and 51.00 when one sixteen-interval window catches only short intervals. That single hertz is the entire width of the feedback signal. Under FIFO the app cannot present faster than the panel anyway, so a measurement two hertz clear of the panel is the only evidence that the panel is what is holding it back; a rise now needs that, and the one-hertz climb still happens through the probe above, which is unchanged.
 
 The anchor the deadband compares against also survives a lost measurement. It used to be cleared after ten unusable samples, so the average restarted from a fresh number and whatever that number rounded to won outright - with no deadband to argue with it. That is how a panel sitting correctly at 50 Hz ended up at 51 for a minute and a half at a time.
 
@@ -274,9 +274,34 @@ The target for sub-floor content is now a whole multiple of the content rate, ta
 
 The last two rows are where the range runs out. Between 30 and 45 fps there is no usable multiple - twice the content is above the ceiling and the content itself is below the floor - so the floor is the best ratio on offer. That is still far better than the plain clamp was: 43 fps against 45 Hz is 1.05:1, one frame in twenty repeated, not half of them.
 
-**This is not VRR, and the difference is the actuator.** A VRR panel changes its refresh timing continuously and for free. Here every change is a full mode switch - PLLD and nvdisp reprogrammed, the panel blanked briefly - so it costs tens of milliseconds and is plainly visible. That single fact explains the shape of everything in this document: the one hertz deadband, the four second hold, the two hertz rise band, the parking backoff, the whole distinction between an excursion and a settled rate. They are all there because the actuator is discrete, slow and expensive, not because the measurement is bad.
+**This is not VRR, and until 2.1.37 this document described the difference wrongly.** The earlier text here said every rate change was a full mode switch - PLLD and nvdisp reprogrammed, the panel blanked, tens of milliseconds, plainly visible - and used that to justify the four second hold. Reading `SetDisplayRefreshRate()` rather than trusting the description showed a different picture. In handheld it takes the `setPLLDHandheldRefreshRate()` path, which writes one word to `PLLD_BASE` and one to `PLLD_MISC` and returns. No mode set, no blanking, no ioctl to wait on. The four second hold was protecting against a cost that did not exist on this path.
 
-What that buys is worth stating plainly. A 60 fps game sits at 60 and never moves. A 30 fps game sits at 60 with perfect 2:1 cadence. A game whose rate genuinely wanders gets a panel that follows it, a few hertz at a time, with a mode switch each time it moves. What it does not give is a panel that tracks frame by frame.
+What is true is narrower and more interesting. The panel re-locks on a frame boundary, so a change costs about one frame - not nothing, but not a visible pause either. And the change is an *event*, not a continuum: one constant replaces another and stays there until the next event. A VRR panel varies the interval of every scanline; this can only pick the next constant. That is the real distance from VRR, and it is a distance in resolution, not in cost.
+
+So a 60 fps game sits at 60 and never moves. A 30 fps game sits at 60 with perfect 2:1 cadence. A game whose rate genuinely wanders gets a panel that follows it, hertz by hertz, arriving in one step instead of crawling. What it does not get is a panel that tracks frame by frame.
+
+### Nothing waits any more: direct tracking
+
+Everything before 2.1.37 stacked delay on delay, and each layer was individually defensible. `FINE_TAU_MS` was a 2140 ms average. `REFRESH_RATE_FINE_MS` was a four second hold before the decision could be acted on. `FINE_RISE_STEP` capped a move at two hertz, so a 60 -> 47 fall took seven writes. In series they made a real scene change take 6.6 seconds to reach the panel.
+
+All three are gone.
+
+**The average was the worst of them, because it was averaging something already averaged.** `FPSavg` is not a raw frame counter - it is the publisher's own window, a second for NetherSX2 and similar for NX-FPS. Putting a 2140 ms time constant on top of a one second average meant the loop was responding to a value that described a scene two seconds gone. It was there to stop one bad sample from reaching the decision, and `FINE_REJECT_MS` already does that earlier and more sharply: anything more than two hertz from the current value is refused until it has persisted. The extra stage bought no protection at all and cost two seconds of every response. Samples are now taken as published, and the filtering happens in `fineMeasuredTarget`, where a difference is judged - a decision is a much better place to be conservative than a measurement is.
+
+**The hold is now a rate limit on the actuator, not a delay in the decision.** Instead of requiring a change to survive a timer before it is allowed, the loop allows at most one write every 700 ms and otherwise acts on the next tick, which is ten milliseconds away. The difference matters: a timer adds latency to every change including the real ones, while a limit only costs anything when changes are rapid - which is exactly when damping is wanted. The 700 ms is not a compromise either; the fastest publisher here is once a second, so a change can never be justified more often than that.
+
+**And the step cap is gone, because the thing it protected against does not exist.** Two hertz at a time was right when each step was believed to be an expensive mode switch. It is two register writes, so a 60 -> 47 fall is one write, not seven, and the evidence that produced the target - persistence through the jump rejection and the deadband - was already required.
+
+| | 2.1.36 | 2.1.37 |
+|---|---|---|
+| estimator | 2140 ms average | as published |
+| decision to action | 4 s hold | one tick, rate-limited to 1 per 700 ms |
+| a 60 -> 47 fall | 7 writes | 1 write |
+| **total, scene change to panel** | **6.6 s** | **~3.1 s** |
+
+The remaining three seconds are `FINE_REJECT_MS` and nothing else. That is the deliberate part, and it is the one place where being fast would be a mistake - see the asymmetry below. It is now the whole latency budget rather than one of four terms in it.
+
+**One thing still cannot be tracked, and it is worth being clear about.** Under vsync the panel paces the app, so an app held at 47 measures 47 whether it could do 50 or not - the signal that would justify a rise does not exist in the measurement. Rising therefore cannot be inferred, only tested: after eight seconds of the measurement agreeing with the panel, the loop raises it one hertz for six seconds and watches. If the app follows, the panel stays; if not, that rate is parked. Eight seconds instead of fifteen is the only change here, and it makes the discovery faster without changing how often a wrong guess is retried.
 
 ### FPSLocker, or this? They answer different questions
 
@@ -354,29 +379,32 @@ Going to ten publishes a second from the client would not help further: its sixt
 
 ### How fast the loop reacts
 
-Three delays sit in series, and it is worth knowing which one is which:
+Until 2.1.37 the answer was "four and a half seconds, in two stages". Now there is one stage that matters:
 
 | stage | period | where |
 |---|---|---|
 | client publishes `FPSavg` | 1 s | `saltysd_display_sync_poll()`, `s_next_query_tick` |
-| sysmodule reads it | was 900 ms, now 250 ms | `FINE_SAMPLE_MS` |
-| panel is moved | 4 s hold, 1.5 s for a large drop | `REFRESH_RATE_FINE_MS` |
+| sysmodule reads it | 100 ms | `FINE_SAMPLE_MS` |
+| a jump has to persist | 3 s | `FINE_REJECT_MS` |
+| panel is moved | one tick later, at most one write per 700 ms | `FINE_CHANGE_MIN_MS` |
 
-The 900 ms could only ever lose time. It was picked to match a client that publishes once a second, but the two clocks are not in step: a value that arrived just after a sample waited almost a full second to be read, on top of the client's own delay. Reading four times a second removes up to 650 ms of that, and a coefficient derived from the measured interval keeps the wall-clock smoothing identical - the same filter, sampled more finely.
+The 2140 ms averaging filter is gone. `FPSavg` is already an average over the publisher's own window, so that filter was a second averaging stage stacked on the first - it made a 50 -> 45 scene take 4.78 s to reach ninety percent, and the only thing it bought was protection from single bad samples, which the jump rejection already provides. The accounting is in "Nothing waits any more" above.
 
-Measured on a step from 50 to 45 fps: the average reaches halfway 2.54 s after the step instead of 2.72 s, and closes 90% of it in 7.22 s instead of 7.27 s. The smoothing did not get faster; the reporting did.
+The 100 ms sampling interval, the jump-rejection hold and the unusable-sample grace are all durations rather than sample counts. That matters because they were counts: ten samples was ten seconds at 900 ms and would have been a fifth of that at 250 ms, so raising the rate without converting them would have quietly made the filter many times twitchier.
 
-The sampling interval, the jump-rejection hold and the unusable-sample grace are all durations now rather than sample counts. That matters because they were counts: ten samples was ten seconds at 900 ms and would have been two and a half at 250 ms, so raising the rate alone would have quietly made the filter three times twitchier.
+The 700 ms between writes is not a debounce. A debounce adds latency to every change including the real ones; this only costs anything when changes are rapid, which is exactly when damping is wanted. It is also doing a second job: the sample arriving right after a write was measured *during* the transition, so deciding on it turns one event into two writes in opposite directions.
 
-The 4 s hold is deliberately unchanged. The deadband decides *whether* the panel should move; the hold only decides *when*, and it is what stops a single noisy second from moving the panel. A one hertz climb does not pay it at all - fine probes hold for zero milliseconds - so the recovery path is not affected.
+**The three second rejection is not timidity, it is the shape of the problem.** A fall is cheap to make and expensive to undo. Once the panel drops to 45 the compositor paces the app there, the app then measures 45, and nothing in the measurement can tell "the game runs at 45" apart from "the panel is holding it at 45". The only way back up is a probe: eight seconds of agreement, then a six second test per hertz, so about thirty seconds to recover five. A fall caused by a two second stutter therefore costs far more than three seconds of extra latency on every genuine change. Dips of up to three seconds are ignored; a scene that actually changed is followed three seconds later.
 
-The remaining second belongs to the client. Its ring holds sixteen present intervals, which is 320 ms at 50 Hz, so it measures three times more than it publishes and throws the rest away. `nethersx2-fpsavg-v3-handoff.md` drops that to 250 ms; the sysmodule follows whatever cadence arrives, so it takes effect without a matching release here.
+**And a single bad sample is no longer enough to start that fall.** The last three values the publisher actually produced are kept in a ring - only changes go in, so nine of every ten reads contribute nothing - and the median of those three is what the loop acts on. One dip among three cannot win the median, which removes the exact case that matters: a lone low sample moving a correct panel, and costing half a minute to undo. A change that persists replaces the whole ring within two publishes, so it costs about a second on a real scene change and nothing on noise.
 
-Fine mode also stopped jumping. On 2.1.29 a single measurement took the panel from 45 to 60 Hz after 1.5 seconds, with the value still reading 45.09 fourteen seconds earlier - a spurious burst of presents, fifteen hertz of mode switch. Rises now always take the full four second hold, and move at most two hertz per step, so a wrong reading costs one step and falls straight back while a real scene change still arrives, one hold at a time. Drops keep their short hold: falling is cheap to be wrong about, and the panel below the app is the judder this whole path exists to remove.
+What is left is the client's cadence, and nothing on this side can beat it. Its ring holds sixteen present intervals, 320 ms at 50 Hz, and publishes once a second, so it measures three times more than it reports. `nethersx2-fpsavg-v3-handoff.md` drops that to 250 ms; the sysmodule follows whatever cadence arrives, so that takes effect without a matching release here. A native game is limited in the same way by whatever NX-FPS is doing.
+
+Fine mode also used to step towards its target, two hertz at a time, and that is gone too: a 60 -> 47 fall is one write now, not seven. The evidence that produced the target - persistence through the jump rejection, then the deadband - was already required, so the cap was only paying for a doubt the earlier stages had removed. On 2.1.29 a single measurement took the panel from 45 to 60 Hz after 1.5 seconds, with the value still reading 45.09 fourteen seconds earlier; that specific failure is now impossible for a different reason, because a fifteen hertz jump is refused for three seconds before it is believed at all.
 
 The climb is 45 -> 46 -> 47 ... until a test fails, so a panel that was holding a 50 FPS game at 45 recovers all five hertz on its own, about ninety seconds end to end.
 
-That last condition is what keeps the test out of the way of a game that is simply running correctly. A title sitting at 50 Hz that has never measured above 50 has nothing to prove and is never tested - otherwise it would be pushed to 51 every fifteen seconds forever, which would be a defect of its own. Only the drop is ambiguous, and only a drop that follows a higher rate leaves the evidence behind.
+That last condition is what keeps the test out of the way of a game that is simply running correctly. A title sitting at 50 Hz that has never measured above 50 has nothing to prove and is never tested - otherwise it would be pushed to 51 every eight seconds forever, which would be a defect of its own. Only the drop is ambiguous, and only a drop that follows a higher rate leaves the evidence behind.
 
 A game that genuinely runs at 45 after having run at 50 loses six seconds of every five minutes to a one-hertz excursion, which is the price of never being stuck.
 
