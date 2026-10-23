@@ -312,7 +312,13 @@ static u64 pendingRefreshRequired = 0;
 // the panel would never find out. The test itself lasts six seconds, not twelve - the
 // client publishes once a second and the average crosses 2 Hz in two or three samples.
 #define FINE_RETRY_MS        300000ULL
+#define FINE_RETRY_MAX_MS    1800000ULL
 #define FINE_PROBE_WINDOW_MS 6000ULL
+// The measurement wanders by half a hertz, so rounding it to a whole hertz flips
+// between two neighbours every few seconds - and every flip is a panel mode switch.
+// The requested rate therefore keeps a deadband of its own: it only moves when the
+// measurement has clearly left it, not when it grazes the boundary.
+#define FINE_TARGET_HYST     0.55f
 
 static bool probeArmed = false;      // last applied change went below the demonstrated max
 static uint32_t probeFromRate = 0;   // rate we left to test upward, 0 = not testing
@@ -412,6 +418,12 @@ static uint32_t fineInvalid = 0;
 // above the panel, so "the app is capable of more" cannot be observed at the moment
 // it matters - only remembered from before the drop.
 static float finePeak = 0.0f;
+// The rate this path is currently asking the panel for, and the evidence counters the
+// escape test keeps. fineEverMeasured: the app has published at least one usable
+// value, so a later silence is a pause, not a missing publisher.
+static uint32_t fineTarget = 0;
+static bool fineEverMeasured = false;
+static uint32_t probeFailCount = 0;
 
 static void fineSampleMeasurement() {
     if (!fineSyncEnabled || isDocked || !nx_fps) {
@@ -458,6 +470,7 @@ static void fineSampleMeasurement() {
         return;
     }
     fineRejects = 0;
+    fineEverMeasured = true;
     fineAvg += (avg - fineAvg) * FINE_SMOOTHING;
     if (fineAvg > finePeak)
         finePeak = fineAvg;
@@ -465,14 +478,25 @@ static void fineSampleMeasurement() {
 
 // Returns 0 when there is nothing trustworthy to follow.
 static uint32_t fineMeasuredTarget() {
-    if (!fineAvgValid)
+    if (!fineAvgValid) {
+        fineTarget = 0;
         return 0;
+    }
     const float avg = fineAvg;
     uint32_t target = (uint32_t)(avg + 0.5f);
     if (target < HandheldModeRefreshRateAllowed.min)
         target = HandheldModeRefreshRateAllowed.min;
     else if (target > HandheldModeRefreshRateAllowed.max)
         target = HandheldModeRefreshRateAllowed.max;
+    // Stay where we are while the measurement is still grazing the rate we already
+    // asked for. Without this a smoothed 48.9 rounds to 49, drops the panel, and the
+    // next sample rounds back to 50 - a mode switch every few seconds that looks
+    // exactly like the judder it was supposed to remove.
+    if (fineTarget && target != fineTarget &&
+        avg > (float)fineTarget - FINE_TARGET_HYST &&
+        avg < (float)fineTarget + FINE_TARGET_HYST)
+        target = fineTarget;
+    fineTarget = target;
     return target;
 }
 
@@ -560,6 +584,9 @@ void cleanAppData() {
     sameRateSince = 0;
     finePinnedSince = 0;
     finePeak = 0.0f;
+    fineTarget = 0;
+    fineEverMeasured = false;
+    probeFailCount = 0;
     minRateClampLogged = false;
     testSweepIndex = 0;
     testSweepNextStep = 0;
@@ -590,6 +617,17 @@ void cleanAppData() {
     }
 }
 
+// How long to wait before testing the same rate again. Every consecutive failure
+// doubles it, so a rate that is genuinely impossible stops costing an excursion at
+// all after a handful of tries, while a scene change still gets retried within
+// minutes. A success resets the count: the panel is following the app again.
+static u64 fineRetryWindowMs() {
+    u64 ms = FINE_RETRY_MS;
+    for (uint32_t i = 1; i < probeFailCount && ms < FINE_RETRY_MAX_MS; i++)
+        ms *= 2;
+    return ms > FINE_RETRY_MAX_MS ? FINE_RETRY_MAX_MS : ms;
+}
+
 void updateRefreshRateForApp() {
     if (runTestSweep()) {
         pendingRefreshRate = 0;
@@ -615,7 +653,7 @@ void updateRefreshRateForApp() {
                 fineNoDataSince = 0;
                 fineNoDataLogged = false;
             }
-            else if (nx_fps) {
+            else if (nx_fps && !fineEverMeasured) {
                 if (fineNoDataSince == 0)
                     fineNoDataSince = nowFine;
                 else if (!fineNoDataLogged && nowFine - fineNoDataSince >= 30000ULL * SV_TICKS_PER_MS) {
@@ -685,6 +723,7 @@ void updateRefreshRateForApp() {
                 probeArmed = false;
                 probeFromFine = false;
                 probeTarget = 0;
+                probeFailCount = 0;
                 sameRateSince = 0;
                 pendingRefreshRate = 0;
             }
@@ -693,6 +732,8 @@ void updateRefreshRateForApp() {
                 SetDisplayRefreshRate(probeFromRate);
                 probeFailedRate = probeFromRate;
                 probeFailedSince = now;
+                if (probeFailCount < 8)
+                    probeFailCount++;
                 if (GetDisplayRefreshRate(&achieved, true))
                     SaltyNX_printf(APP_NAME ": display-sync: %u Hz is real, back from the test (target %u Hz, active %u Hz)\n",
                                    probeFromRate, check_refresh_rate, achieved);
@@ -793,14 +834,17 @@ void updateRefreshRateForApp() {
             // pushed to 51 every fifteen seconds forever, which is a defect of its own.
             const float agree = fineAvg - (float)temp_refreshRate;
             const bool measurementOnPanel = fineAvgValid && agree < 0.6f && agree > -0.6f;
-            const uint32_t demonstrated = (uint32_t)(finePeak + 0.5f);
-            const bool worthTesting = temp_refreshRate + FINE_LOCK_STEP <= demonstrated;
+            // One whole hertz of headroom, measured earlier in this session. A peak of
+            // 50.8 next to a 50 Hz panel is the app grazing its own rate, not evidence
+            // that the panel is holding it back, and testing it costs a visible
+            // excursion for nothing.
+            const bool worthTesting = finePeak >= (float)temp_refreshRate + 1.0f;
             if (fineRate && measurementOnPanel && worthTesting &&
                 temp_refreshRate < HandheldModeRefreshRateAllowed.max && !probeFromRate) {
                 if (finePinnedSince == 0)
                     finePinnedSince = now;
                 const bool parked = (temp_refreshRate == probeFailedRate) &&
-                                    (now - probeFailedSince < FINE_RETRY_MS * SV_TICKS_PER_MS);
+                                    (now - probeFailedSince < fineRetryWindowMs() * SV_TICKS_PER_MS);
                 if (!probeArmed && !parked &&
                     now - finePinnedSince >= FINE_LOCK_SUSPECT_MS * SV_TICKS_PER_MS)
                     probeArmed = true;
