@@ -166,7 +166,7 @@ Values outside 30..240 fps are ignored: `FPSavg` starts at 255 in NX-FPS and is 
 
 A client publishes that number as a whole hertz, once a second, from a window of sixteen frames. A single hitch - a stalled worker thread, a disc read that blocked for 2.6 s - inflates the mean interval enough to report five hertz low for one second and then snap back. Fine mode cannot build a one-hertz decision on that, so it takes one sample a second, refuses any that jump more than 2 Hz, and averages the rest with a 0.35 coefficient (about three seconds). Ten refusals in a row is not noise any more - that is a new scene or a new app - so the average restarts from the new value instead of sitting on a stale one. That is also what stops a lock from surviving a scene change.
 
-Samples the client cannot produce at all - `FPSavg` of 0 before it publishes anything, or 14..29 for a second after a multi-second stall - are skipped rather than allowed to wipe the average. Wiping it was a real misbehaviour: the target fell back to the client's 5 Hz path, floor and probe included, and the panel climbed to 55 in the middle of a hitch. Giving up the average now takes ten unusable samples in a row, about nine seconds.
+Samples the client cannot produce at all - `FPSavg` of 0 before it publishes anything, or 14..29 for a second after a multi-second stall - are skipped rather than allowed to wipe the average. Wiping it was a real misbehaviour: the target fell back to the client's 5 Hz path, floor and probe included, and the panel then followed a number that had nothing to do with the scene. Giving up the average now takes ten unusable samples in a row, about nine seconds.
 
 Fine mode is only as good as the measurement behind it, and that is the open question. `FPSavg` is written from NX-FPS's present hook, which is installed by rewriting the game's import table - a game that resolves `vkQueuePresentKHR` at runtime, the way a Vulkan wrapper does, never calls the hooked copy. When that happens the shared field keeps its initial 255 and fine mode silently does nothing, which looks exactly like "the panel just did not want to move".
 
@@ -267,7 +267,7 @@ A rise cannot get stuck that way, because the app can always correct it down. So
 
 ```
 SaltyNX: display-sync: testing 50 Hz against 55 Hz, which the app held before
-SaltyNX: display-sync: 50 Hz was locked in, target followed to 55 Hz (active 55 Hz)
+SaltyNX: display-sync: 50 Hz was not a lock, target followed to 55 Hz (active 55 Hz)
 ```
 
 or
